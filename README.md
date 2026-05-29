@@ -237,12 +237,12 @@ For detailed instructions on how to create the updater branch, clone it onto you
 
 ## Nginx Subpath Configuration
 
-The API container binds to port `18140` on localhost inside the server. To publish it under your subpath `https://office.naz4rimusic.com/tools/spotiflacapi`, configure Nginx to proxy requests to `http://127.0.0.1:18140/`:
+The API container binds to port `18150` on localhost inside the server. To publish it under your subpath `https://office.naz4rimusic.com/tools/spotiflacapi`, configure Nginx to proxy requests to `http://127.0.0.1:18150/`:
 
 ```nginx
 # Proxy block for SpotiFLAC API served under a subpath
 location /tools/spotiflacapi/ {
-    proxy_pass http://127.0.0.1:18140/;
+    proxy_pass http://127.0.0.1:18150/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -257,24 +257,24 @@ location /tools/spotiflacapi/ {
 ```
 
 > [!IMPORTANT]
-> The trailing slash in `proxy_pass http://127.0.0.1:18140/;` is critical. It replaces the `/tools/spotiflacapi/` subpath portion of the request URI so that the API container receives clean endpoints like `/health` and `/v1/download-url` instead of `/tools/spotiflacapi/health`.
+> The trailing slash in `proxy_pass http://127.0.0.1:18150/;` is critical. It replaces the `/tools/spotiflacapi/` subpath portion of the request URI so that the API container receives clean endpoints like `/health` and `/v1/download-url` instead of `/tools/spotiflacapi/health`.
 
 ---
 
 ## Security & Firewall Verification
 
 ### 1. Local port binding
-The API service runs in a Docker container that publishes port `18140` bound exclusively to the loopback interface (`127.0.0.1`). This prevents public access bypassing Nginx. You can verify this binding on your host by running:
+The API service runs in a Docker container that publishes port `18150` bound exclusively to the loopback interface (`127.0.0.1`). This prevents public access bypassing Nginx. You can verify this binding on your host by running:
 ```bash
-ss -tulpn | grep 18140
+ss -tulpn | grep 18150
 ```
 Expected output:
 ```text
-tcp   LISTEN 0      4096       127.0.0.1:18140      0.0.0.0:*
+tcp   LISTEN 0      4096       127.0.0.1:18150      0.0.0.0:*
 ```
 
 ### 2. UFW status
-To ensure no external access is permitted directly to the container, keep UFW active and do not open port `18140` to public interfaces:
+To ensure no external access is permitted directly to the container, keep UFW active and do not open port `18150` to public interfaces:
 ```bash
 sudo ufw status
 ```
