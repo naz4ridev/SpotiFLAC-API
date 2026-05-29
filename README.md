@@ -223,3 +223,62 @@ After changing upstream:
 go build ./...
 go test ./...
 ```
+
+## Automated SpotiFLAC updates
+
+To keep the production environment clean, the automated updater and monitoring scripts reside on a dedicated branch named `spotiflac-updater` in this same repository. 
+
+- **`main` Branch**: Contains only the core Go API codebase, `Dockerfile`, and `docker-compose.yml`. This is the branch that Coolify pulls, builds, and deploys to production.
+- **`spotiflac-updater` Branch**: Contains only the update script (`update.sh`), daily verification script (`daily-smoke.sh`), systemd timer configuration, and documentation. This is cloned on the host server at `/opt/spotiflac-updater` and schedules updates via local cron timers.
+
+For detailed instructions on how to create the updater branch, clone it onto your server, configure `.env`, and register automation timers, see the **[updater/README.md](file:///home/mariano_palomo/dev/personal/proyectos_personales/SpotiFLAC-API/updater/README.md)** file.
+
+---
+
+## Nginx Subpath Configuration
+
+The API container binds to port `18140` on localhost inside the server. To publish it under your subpath `https://office.naz4rimusic.com/tools/spotiflacapi`, configure Nginx to proxy requests to `http://127.0.0.1:18140/`:
+
+```nginx
+# Proxy block for SpotiFLAC API served under a subpath
+location /tools/spotiflacapi/ {
+    proxy_pass http://127.0.0.1:18140/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    
+    # Increase timeouts because track conversion and downloading can take time
+    proxy_connect_timeout 120s;
+    proxy_send_timeout    120s;
+    proxy_read_timeout    120s;
+}
+```
+
+> [!IMPORTANT]
+> The trailing slash in `proxy_pass http://127.0.0.1:18140/;` is critical. It replaces the `/tools/spotiflacapi/` subpath portion of the request URI so that the API container receives clean endpoints like `/health` and `/v1/download-url` instead of `/tools/spotiflacapi/health`.
+
+---
+
+## Security & Firewall Verification
+
+### 1. Local port binding
+The API service runs in a Docker container that publishes port `18140` bound exclusively to the loopback interface (`127.0.0.1`). This prevents public access bypassing Nginx. You can verify this binding on your host by running:
+```bash
+ss -tulpn | grep 18140
+```
+Expected output:
+```text
+tcp   LISTEN 0      4096       127.0.0.1:18140      0.0.0.0:*
+```
+
+### 2. UFW status
+To ensure no external access is permitted directly to the container, keep UFW active and do not open port `18140` to public interfaces:
+```bash
+sudo ufw status
+```
+Only ports `80` (HTTP) and `443` (HTTPS) should be allowed from public IPs.
+
+
+

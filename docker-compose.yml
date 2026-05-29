@@ -1,0 +1,23 @@
+services:
+  api:
+    image: ${COMPOSE_PROJECT_NAME:-spotiflacapi}:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-spotiflacapi}
+    restart: unless-stopped
+    ports:
+      # Binds exclusively to 127.0.0.1 (localhost) on the host to keep the service private.
+      # Port 18140 follows the internal application port schema on the server.
+      - "${HOST_BIND_IP:-127.0.0.1}:${HOST_PORT:-18140}:${CONTAINER_PORT:-8080}"
+    env_file:
+      - .env
+    environment:
+      - BIND_ADDR=0.0.0.0
+      - PORT=${CONTAINER_PORT:-8080}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${CONTAINER_PORT:-8080}/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
