@@ -1,0 +1,22 @@
+# Local secrets / runtime config
+.env
+.env.*
+!.env.example
+
+# Runtime state
+state/
+*.lock
+.update.lock
+
+# Logs and temp files
+*.log
+*.tmp
+/tmp/
+spotiflac-coolify-deploy-response.txt
+spotiflac-coolify-deploy-error.txt
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+*.swp

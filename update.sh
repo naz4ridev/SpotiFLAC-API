@@ -81,6 +81,39 @@ push_uptime_kuma() {
   fi
 }
 
+trigger_coolify_deploy() {
+  if [ -z "${COOLIFY_REDEPLOY_URL:-}" ]; then
+    log_error "COOLIFY_REDEPLOY_URL is not set. Deployment cannot proceed."
+    return 1
+  fi
+
+  if [ -z "${COOLIFY_API_TOKEN:-}" ]; then
+    log_error "COOLIFY_API_TOKEN is not set. Deployment cannot proceed."
+    return 1
+  fi
+
+  log_info "Triggering Coolify redeployment..."
+
+  if curl -fsSL -m 60 \
+    --connect-timeout 10 \
+    -X POST "${COOLIFY_REDEPLOY_URL}" \
+    -H "Authorization: Bearer ${COOLIFY_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    >/tmp/spotiflac-coolify-deploy-response.txt 2>/tmp/spotiflac-coolify-deploy-error.txt; then
+    log_info "Coolify redeployment triggered successfully."
+    return 0
+  fi
+
+  log_error "Coolify redeployment request failed."
+  if [ -s /tmp/spotiflac-coolify-deploy-error.txt ]; then
+    log_error "Coolify curl error: $(cat /tmp/spotiflac-coolify-deploy-error.txt)"
+  fi
+  if [ -s /tmp/spotiflac-coolify-deploy-response.txt ]; then
+    log_error "Coolify response: $(cat /tmp/spotiflac-coolify-deploy-response.txt)"
+  fi
+  return 1
+}
+
 resolve_tag_to_sha() {
   local tag="$1"
   local remote_url="https://github.com/${SPOTIFLAC_REPO}.git"
@@ -249,16 +282,10 @@ if ! git push origin "${APP_BRANCH}" 2>&1; then
 fi
 
 # 8. Trigger Coolify deployment
-if [ -z "${COOLIFY_REDEPLOY_URL:-}" ]; then
-  log_error "COOLIFY_REDEPLOY_URL is not set. Deployment cannot proceed."
-  push_uptime_kuma "down" "Error: COOLIFY_REDEPLOY_URL is missing in configuration."
+if ! trigger_coolify_deploy; then
+  push_uptime_kuma "down" "Error: Coolify redeploy request failed."
   rm -rf "$WORKDIR"
   exit 1
-fi
-
-log_info "Triggering Coolify redeployment..."
-if ! curl -fsSL -m 30 -X GET "${COOLIFY_REDEPLOY_URL}" >/dev/null 2>&1; then
-  log_warn "Coolify webhook call returned non-200 or timed out. Checking deployment health anyway..."
 fi
 
 # 9. Poll /health to verify deployment
@@ -308,7 +335,9 @@ if [ "$SMOKE_PASSED" = false ]; then
     log_info "Revert commit created. Pushing to remote '${APP_BRANCH}'..."
     if git push origin "${APP_BRANCH}" 2>&1; then
       log_info "Push successful. Re-triggering Coolify deployment for rollback..."
-      curl -fsSL -m 30 -X GET "${COOLIFY_REDEPLOY_URL}" >/dev/null 2>&1 || true
+      if ! trigger_coolify_deploy; then
+        log_error "Failed to trigger Coolify deployment for rollback."
+      fi
       
       # Wait for previous healthy state to recover
       log_info "Waiting for restored service to recover..."
