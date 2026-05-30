@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke test script for SpotiFLAC API.
-# Tests /health, /v1/download-url, and downloads + validates the file with ffprobe.
+# Tests /health, /diagnostics/providers, /internal/warmup, /v1/download-url, and downloads + validates the file with ffprobe.
 
 set -euo pipefail
 
@@ -23,6 +23,10 @@ log_info() {
   echo -e "${GREEN}[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [INFO]${NC} $1"
 }
 
+log_warn() {
+  echo -e "${YELLOW}[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [WARN]${NC} $1"
+}
+
 log_error() {
   echo -e "${RED}[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR]${NC} $1" >&2
 }
@@ -42,7 +46,13 @@ if [ -z "${TEST_TRACK_URL:-}" ]; then
   exit 1
 fi
 
-# Set default minimum audio size (100KB)
+# Setup defaults for smoke test variables
+SMOKE_STRATEGY=${SMOKE_STRATEGY:-race}
+SMOKE_FORCE_PROVIDER=${SMOKE_FORCE_PROVIDER:-}
+SMOKE_MAX_TIME_SECONDS=${SMOKE_MAX_TIME_SECONDS:-240}
+SMOKE_WARMUP_ENABLED=${SMOKE_WARMUP_ENABLED:-true}
+REQUIRE_ALL_PROVIDERS_HEALTHY=${REQUIRE_ALL_PROVIDERS_HEALTHY:-false}
+SMOKE_REQUIRE_ALL_PROVIDERS=${SMOKE_REQUIRE_ALL_PROVIDERS:-$REQUIRE_ALL_PROVIDERS_HEALTHY}
 MIN_BYTES=${MIN_AUDIO_BYTES:-100000}
 
 # Setup temp files cleanup
@@ -63,20 +73,54 @@ if ! echo "$HEALTH_RESP" | jq -e '.ok == true' >/dev/null; then
 fi
 log_info "Health check passed!"
 
-# 2. Verify POST /v1/download-url
+# 2. Verify GET /diagnostics/providers (if exists)
+DIAGNOSTICS_URL="${BASE_URL}/diagnostics/providers"
+log_info "Testing diagnostics endpoint: GET ${DIAGNOSTICS_URL}"
+if DIAG_RESP=$(curl -fsSL --connect-timeout 10 -m 15 "$DIAGNOSTICS_URL" 2>/dev/null); then
+  log_info "Diagnostics retrieved successfully:"
+  echo "$DIAG_RESP" | jq .
+else
+  log_warn "Diagnostics endpoint returned error or is not reachable."
+fi
+
+# 3. Trigger POST /internal/warmup (if enabled)
+if [ "$SMOKE_WARMUP_ENABLED" = "true" ]; then
+  WARMUP_URL="${BASE_URL}/internal/warmup"
+  log_info "Triggering internal warmup: POST ${WARMUP_URL}"
+  WARMUP_RESP_FILE="${TMP_DIR}/warmup_response.json"
+  
+  WARMUP_HTTP_CODE=$(curl -s -w "%{http_code}" \
+    -X POST \
+    -o "$WARMUP_RESP_FILE" \
+    --connect-timeout 10 -m 70 \
+    "$WARMUP_URL")
+    
+  if [ "$WARMUP_HTTP_CODE" -eq 200 ]; then
+    log_info "Warmup completed successfully: $(cat "$WARMUP_RESP_FILE")"
+  else
+    log_warn "Warmup endpoint returned non-200 HTTP code ($WARMUP_HTTP_CODE). Details: $(cat "$WARMUP_RESP_FILE" 2>/dev/null || echo "no response")"
+  fi
+fi
+
+# 4. Verify POST /v1/download-url
 DOWNLOAD_URL_API="${BASE_URL}/v1/download-url"
 log_info "Requesting download URL: POST ${DOWNLOAD_URL_API}"
+log_info "Using strategy: ${SMOKE_STRATEGY}, forced provider: ${SMOKE_FORCE_PROVIDER:-none}"
 
-# Prepare payload
-JSON_PAYLOAD=$(jq -n --arg url "$TEST_TRACK_URL" '{spotify_url: $url, engine: "auto"}')
+# Prepare JSON payload
+if [ -n "${SMOKE_FORCE_PROVIDER}" ]; then
+  JSON_PAYLOAD=$(jq -n --arg url "$TEST_TRACK_URL" --arg prov "$SMOKE_FORCE_PROVIDER" --arg strat "$SMOKE_STRATEGY" '{spotify_url: $url, provider: $prov, strategy: $strat}')
+else
+  JSON_PAYLOAD=$(jq -n --arg url "$TEST_TRACK_URL" --arg strat "$SMOKE_STRATEGY" '{spotify_url: $url, strategy: $strat}')
+fi
 
-# Call the API. resolution can take time on the backend, so connect timeout is 15s and execution 90s.
+# Call the API. Resolution can take time on the backend
 RESP_FILE="${TMP_DIR}/api_response.json"
 HTTP_CODE=$(curl -s -w "%{http_code}" \
   -H "Content-Type: application/json" \
   -d "$JSON_PAYLOAD" \
   -o "$RESP_FILE" \
-  --connect-timeout 15 -m 90 \
+  --connect-timeout 15 -m "$SMOKE_MAX_TIME_SECONDS" \
   "$DOWNLOAD_URL_API")
 
 if [ "$HTTP_CODE" -ne 200 ]; then
@@ -93,6 +137,16 @@ if ! echo "$API_RESP" | jq -e '.ok == true' >/dev/null; then
   exit 1
 fi
 
+# Validate attempts if SMOKE_REQUIRE_ALL_PROVIDERS is true
+if [ "$SMOKE_REQUIRE_ALL_PROVIDERS" = "true" ]; then
+  FAILED_ATTEMPTS=$(echo "$API_RESP" | jq '[.attempts[] | select(.ok == false)] | length')
+  if [ "$FAILED_ATTEMPTS" -gt 0 ]; then
+    log_error "Some providers failed, and SMOKE_REQUIRE_ALL_PROVIDERS is set to true. Attempts summary:"
+    echo "$API_RESP" | jq '.attempts'
+    exit 1
+  fi
+fi
+
 DOWNLOAD_URL=$(echo "$API_RESP" | jq -r '.download_url')
 if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
   log_error "API response did not contain a valid download_url: ${API_RESP}"
@@ -101,7 +155,7 @@ fi
 
 log_info "Download URL received successfully: ${DOWNLOAD_URL}"
 
-# 3. Download the audio file
+# 5. Download the audio file
 AUDIO_FILE="${TMP_DIR}/test_track.flac"
 log_info "Downloading resolved audio file from ${DOWNLOAD_URL}..."
 
@@ -115,7 +169,7 @@ if [ "$DL_HTTP_CODE" -ne 200 ]; then
   exit 1
 fi
 
-# 4. Verify file size
+# 6. Verify file size
 FILE_SIZE=$(wc -c < "$AUDIO_FILE" | tr -d ' ')
 log_info "Downloaded file size: ${FILE_SIZE} bytes (Minimum required: ${MIN_BYTES} bytes)"
 
@@ -124,7 +178,7 @@ if [ "$FILE_SIZE" -lt "$MIN_BYTES" ]; then
   exit 1
 fi
 
-# 5. Verify format using ffprobe
+# 7. Verify format using ffprobe
 log_info "Verifying file integrity with ffprobe..."
 if ! ffprobe -v error -show_format -show_streams "$AUDIO_FILE" > /dev/null 2>&1; then
   log_error "ffprobe integrity verification failed. The downloaded file is not a valid audio file."

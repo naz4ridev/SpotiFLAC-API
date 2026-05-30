@@ -81,10 +81,17 @@ nano .env
 | `APP_REPO_URL` | SSH URL to your repository (e.g. `git@github.com:user/repo.git`). *Note: Ensure your server user's SSH key has write access to push dependency commits.* |
 | `APP_BRANCH` | Branch deployed by Coolify (`main`). |
 | `WORKDIR` | Temp directory for compilation checking (`/tmp/spotiflacapi-update-workdir`). |
-| `STATE_DIR` | Directory to save the last successfully deployed commit (`/opt/spotiflac-updater/state`). |
+| `STATE_DIR` | Directory to save the last successfully deployed commits (`/opt/spotiflac-updater/state`). State files: `last_go_version`, `last_python_version`. |
 | `BASE_URL` | Public URL of your API (e.g. `https://office.naz4rimusic.com/tools/spotiflacapi`). |
 | `TEST_TRACK_URL` | Spotify track URL used for smoke test validation. |
 | `MIN_AUDIO_BYTES` | Minimum expected file size (default: `100000` bytes). |
+| `GO_SPOTIFLAC_REPO` | Upstream repository for Go provider (default: `spotbye/SpotiFLAC`). |
+| `GO_MODULE_PATH` | Go module import path (default: `github.com/afkarxyz/SpotiFLAC`). |
+| `GO_UPDATE_MODE` | Upstream Go update mode: `release` or `commit`. |
+| `PYTHON_SPOTIFLAC_REPO` | Upstream repository for Python provider (default: `https://github.com/ShuShuzinhuu/SpotiFLAC-Module-Version.git`). |
+| `PYTHON_UPDATE_MODE` | Upstream Python update mode: `commit`. |
+| `PYTHON_REF_FILE` | Pinned ref file inside master branch (default: `.python-spotiflac-ref`). |
+| `SMOKE_STRATEGY` | Default strategy for smoke test (default: `race`). |
 | `COOLIFY_REDEPLOY_URL` | Coolify webhook URL to trigger a deploy. Obtain from the application settings page in Coolify. |
 | `UPTIME_KUMA_UPDATE_PUSH_URL` | Optional Uptime Kuma Push Monitor URL for updates (notifies OK/DOWN). |
 | `UPTIME_KUMA_DAILY_SMOKE_PUSH_URL` | Optional Uptime Kuma Push Monitor URL for the daily smoke test. |
@@ -143,6 +150,7 @@ If a deployed release experiences runtime issues not caught by the smoke test, y
 3. Trigger Coolify redeployment (either via Coolify dashboard or by curling the `COOLIFY_REDEPLOY_URL` webhook).
 4. Update the saved state on the server so the updater doesn't re-apply the update:
    ```bash
-   # Revert the saved version hash to the previous version
-   echo "<previous-short-sha>" > /opt/spotiflac-updater/state/last_version
+   # Revert the saved version hashes to the previous versions
+   echo "<previous-go-short-sha>" > /opt/spotiflac-updater/state/last_go_version
+   echo "<previous-python-short-sha>" > /opt/spotiflac-updater/state/last_python_version
    ```
