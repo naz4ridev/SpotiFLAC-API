@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -124,11 +125,15 @@ type attempt struct {
 }
 
 type providerAttempt struct {
-	Provider        string    `json:"provider"`
-	OK              bool      `json:"ok"`
-	DurationMs      int64     `json:"duration_ms"`
-	Error           string    `json:"error,omitempty"`
-	ServiceAttempts []attempt `json:"service_attempts,omitempty"`
+	Provider            string    `json:"provider"`
+	OK                  bool      `json:"ok"`
+	DurationMs          int64     `json:"duration_ms"`
+	Error               string    `json:"error,omitempty"`
+	ServiceAttempts     []attempt `json:"service_attempts,omitempty"`
+	ExpectedDurationMs  *int64    `json:"expected_duration_ms,omitempty"`
+	ActualDurationMs    *int64    `json:"actual_duration_ms,omitempty"`
+	DurationMatch       *bool     `json:"duration_match,omitempty"`
+	DurationToleranceMs *int64    `json:"duration_tolerance_ms,omitempty"`
 }
 
 type createDownloadRequest struct {
@@ -142,17 +147,21 @@ type createDownloadRequest struct {
 }
 
 type createDownloadResponse struct {
-	OK          bool              `json:"ok"`
-	SpotifyID   string            `json:"spotify_id,omitempty"`
-	Service     string            `json:"service,omitempty"`
-	Method      string            `json:"method,omitempty"`
-	Filename    string            `json:"filename,omitempty"`
-	DownloadURL string            `json:"download_url,omitempty"`
-	ExpiresAt   time.Time         `json:"expires_at,omitempty"`
-	Attempts    []providerAttempt `json:"attempts,omitempty"`
-	Error       string            `json:"error,omitempty"`
-	Provider    string            `json:"provider,omitempty"`
-	DurationMs  int64             `json:"duration_ms,omitempty"`
+	OK                  bool              `json:"ok"`
+	SpotifyID           string            `json:"spotify_id,omitempty"`
+	Service             string            `json:"service,omitempty"`
+	Method              string            `json:"method,omitempty"`
+	Filename            string            `json:"filename,omitempty"`
+	DownloadURL         string            `json:"download_url,omitempty"`
+	ExpiresAt           time.Time         `json:"expires_at,omitempty"`
+	Attempts            []providerAttempt `json:"attempts,omitempty"`
+	Error               string            `json:"error,omitempty"`
+	Provider            string            `json:"provider,omitempty"`
+	DurationMs          int64             `json:"duration_ms,omitempty"`
+	ExpectedDurationMs  *int64            `json:"expected_duration_ms,omitempty"`
+	ActualDurationMs    *int64            `json:"actual_duration_ms,omitempty"`
+	DurationMatch       *bool             `json:"duration_match,omitempty"`
+	DurationToleranceMs *int64            `json:"duration_tolerance_ms,omitempty"`
 }
 
 type errorResponse struct {
@@ -536,6 +545,13 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	expectedDurationMs, metadataErr := fetchExpectedDurationMs(ctx, spotifyURL)
+	if metadataErr != nil {
+		log.Printf("[DOWNLOAD-URL] Warning: failed to fetch expected duration: %v", metadataErr)
+	} else {
+		log.Printf("[DOWNLOAD-URL] Fetched expected duration: %d ms", expectedDurationMs)
+	}
+
 	workDir, err := os.MkdirTemp("", "spotiflac-rest-")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, createDownloadResponse{
@@ -556,11 +572,12 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 	log.Printf("[DOWNLOAD-URL] Using strategy: %s with providers: %v", strategy, providers)
 
 	dlReq := downloadRequest{
-		SpotifyID:    spotifyID,
-		SpotifyURL:   spotifyURL,
-		Metadata:     meta,
-		ServiceOrder: serviceOrder,
-		OutputDir:    workDir,
+		SpotifyID:          spotifyID,
+		SpotifyURL:         spotifyURL,
+		Metadata:           meta,
+		ServiceOrder:       serviceOrder,
+		OutputDir:          workDir,
+		ExpectedDurationMs: expectedDurationMs,
 	}
 
 	manager := NewProviderManager(providers, strategy)
@@ -605,10 +622,17 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		elapsedMs := time.Since(startTime).Milliseconds()
 		log.Printf("[DOWNLOAD-URL] Request failed after %d ms: %s", elapsedMs, res.Error)
 		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
-			OK:         false,
-			Error:      res.Error,
-			Attempts:   res.Attempts,
-			DurationMs: elapsedMs,
+			OK:                  false,
+			Error:               res.Error,
+			Attempts:            res.Attempts,
+			DurationMs:          elapsedMs,
+			Provider:            res.ProviderName,
+			Service:             res.ServiceUsed,
+			Method:              res.MethodUsed,
+			ExpectedDurationMs:  res.ExpectedDurationMs,
+			ActualDurationMs:    res.ActualDurationMs,
+			DurationMatch:       res.DurationMatch,
+			DurationToleranceMs: res.DurationToleranceMs,
 		})
 		return
 	}
@@ -626,16 +650,20 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 	log.Printf("[DOWNLOAD-URL] Request completed in %d ms (download_url: %s)", elapsedMs, downloadURL)
 
 	writeJSON(w, http.StatusOK, createDownloadResponse{
-		OK:          true,
-		SpotifyID:   spotifyID,
-		Service:     res.ServiceUsed,
-		Method:      res.MethodUsed,
-		Filename:    filepath.Base(entry.Path),
-		DownloadURL: downloadURL,
-		ExpiresAt:   entry.ExpiresAt.UTC(),
-		Attempts:    res.Attempts,
-		Provider:    res.ProviderName,
-		DurationMs:  elapsedMs,
+		OK:                  true,
+		SpotifyID:           spotifyID,
+		Service:             res.ServiceUsed,
+		Method:              res.MethodUsed,
+		Filename:            filepath.Base(entry.Path),
+		DownloadURL:         downloadURL,
+		ExpiresAt:           entry.ExpiresAt.UTC(),
+		Attempts:            res.Attempts,
+		Provider:            res.ProviderName,
+		DurationMs:          elapsedMs,
+		ExpectedDurationMs:  res.ExpectedDurationMs,
+		ActualDurationMs:    res.ActualDurationMs,
+		DurationMatch:       res.DurationMatch,
+		DurationToleranceMs: res.DurationToleranceMs,
 	})
 }
 
@@ -652,22 +680,27 @@ var (
 )
 
 type downloadRequest struct {
-	SpotifyID    string
-	SpotifyURL   string
-	Metadata     trackMetadata
-	ServiceOrder []string
-	OutputDir    string
+	SpotifyID          string
+	SpotifyURL         string
+	Metadata           trackMetadata
+	ServiceOrder       []string
+	OutputDir          string
+	ExpectedDurationMs int64
 }
 
 type downloadResult struct {
-	OK           bool
-	FilePath     string
-	ProviderName string
-	ServiceUsed  string
-	MethodUsed   string
-	DurationMs   int64
-	Attempts     []providerAttempt
-	Error        string
+	OK                  bool
+	FilePath            string
+	ProviderName        string
+	ServiceUsed         string
+	MethodUsed          string
+	DurationMs          int64
+	Attempts            []providerAttempt
+	Error               string
+	ExpectedDurationMs  *int64
+	ActualDurationMs    *int64
+	DurationMatch       *bool
+	DurationToleranceMs *int64
 }
 
 type DownloadProvider interface {
@@ -724,6 +757,46 @@ func (p *GoProvider) Download(ctx context.Context, req downloadRequest) download
 		}
 	}
 
+	var valResult monochromeValidationResult
+	var valRun bool
+
+	if err == nil && serviceUsed == downloadEngineMonochrome {
+		valRun = true
+		ffprobePath, ffprobeErr := backend.GetFFprobePath()
+		if ffprobeErr != nil {
+			ffprobePath = "ffprobe"
+		}
+		requireMatch := envBoolDefaultTrue("MONOCHROME_REQUIRE_DURATION_MATCH")
+		toleranceSeconds := envIntDefault("MONOCHROME_DURATION_TOLERANCE_SECONDS", 3)
+		tolerancePercent := envIntDefault("MONOCHROME_DURATION_TOLERANCE_PERCENT", 2)
+
+		valResult = validateMonochromeDuration(ffprobePath, downloadPath, req.ExpectedDurationMs, requireMatch, toleranceSeconds, tolerancePercent)
+		if !valResult.OK {
+			_ = os.Remove(downloadPath)
+			err = valResult.Err
+		}
+	}
+
+	var expMs *int64
+	var actMs *int64
+	var durMatch *bool
+	var tolMs *int64
+	if valRun {
+		expMs = &valResult.ExpectedDurationMs
+		if valResult.ActualDurationMs > 0 {
+			actMs = &valResult.ActualDurationMs
+		}
+		durMatch = &valResult.DurationMatch
+		if valResult.DurationToleranceMs > 0 {
+			tolMs = &valResult.DurationToleranceMs
+		}
+
+		res.ExpectedDurationMs = expMs
+		res.ActualDurationMs = actMs
+		res.DurationMatch = durMatch
+		res.DurationToleranceMs = tolMs
+	}
+
 	durationMs := time.Since(startTime).Milliseconds()
 	if err == nil {
 		res.OK = true
@@ -731,22 +804,31 @@ func (p *GoProvider) Download(ctx context.Context, req downloadRequest) download
 		res.ServiceUsed = serviceUsed
 		res.Attempts = []providerAttempt{
 			{
-				Provider:        "go",
-				OK:              true,
-				DurationMs:      durationMs,
-				ServiceAttempts: attempts,
+				Provider:            "go",
+				OK:                  true,
+				DurationMs:          durationMs,
+				ServiceAttempts:     attempts,
+				ExpectedDurationMs:  expMs,
+				ActualDurationMs:    actMs,
+				DurationMatch:       durMatch,
+				DurationToleranceMs: tolMs,
 			},
 		}
 	} else {
 		res.OK = false
 		res.Error = err.Error()
+		res.ServiceUsed = serviceUsed
 		res.Attempts = []providerAttempt{
 			{
-				Provider:        "go",
-				OK:              false,
-				DurationMs:      durationMs,
-				Error:           err.Error(),
-				ServiceAttempts: attempts,
+				Provider:            "go",
+				OK:                  false,
+				DurationMs:          durationMs,
+				Error:               err.Error(),
+				ServiceAttempts:     attempts,
+				ExpectedDurationMs:  expMs,
+				ActualDurationMs:    actMs,
+				DurationMatch:       durMatch,
+				DurationToleranceMs: tolMs,
 			},
 		}
 	}
@@ -779,7 +861,15 @@ func (p *PythonProvider) Download(ctx context.Context, req downloadRequest) down
 	subCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(subCtx, pythonBin, p.wrapperPath,
+	wrapperPath := p.wrapperPath
+	if _, statErr := os.Stat(wrapperPath); os.IsNotExist(statErr) {
+		wrapperPath = "scripts/python-provider/download.py"
+		if _, statErr = os.Stat(wrapperPath); os.IsNotExist(statErr) {
+			wrapperPath = "../scripts/python-provider/download.py"
+		}
+	}
+
+	cmd := exec.CommandContext(subCtx, pythonBin, wrapperPath,
 		"--url", req.SpotifyURL,
 		"--output-dir", req.OutputDir,
 		"--timeout", strconv.Itoa(timeoutSecs),
@@ -1203,6 +1293,46 @@ func (s *apiServer) handleDiagnosticsProviders(w http.ResponseWriter, r *http.Re
 	} else {
 		results["python_ref"] = "unknown"
 	}
+
+	metadataHelperPath := envStringDefault("PYTHON_METADATA_HELPER_PATH", "/app/scripts/python-provider/metadata.py")
+	if _, statErr := os.Stat(metadataHelperPath); os.IsNotExist(statErr) {
+		if _, statErr = os.Stat("scripts/python-provider/metadata.py"); statErr == nil {
+			metadataHelperPath = "scripts/python-provider/metadata.py"
+		} else if _, statErr = os.Stat("../scripts/python-provider/metadata.py"); statErr == nil {
+			metadataHelperPath = "../scripts/python-provider/metadata.py"
+		}
+	}
+	_, helperStatErr := os.Stat(metadataHelperPath)
+	helperAvailable := (helperStatErr == nil)
+
+	helperImportOk := false
+	if helperAvailable {
+		pythonExecBin := pythonBin
+		if _, statErr := os.Stat(pythonExecBin); os.IsNotExist(statErr) {
+			pythonExecBin = "python3"
+		}
+		cmd := exec.Command(pythonExecBin, metadataHelperPath, "--url", "https://open.spotify.com/track/invalid")
+		var stdoutBuf bytes.Buffer
+		cmd.Stdout = &stdoutBuf
+		_ = cmd.Run()
+
+		var helperOut struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(stdoutBuf.Bytes(), &helperOut); err == nil {
+			if !strings.Contains(helperOut.Error, "Failed to import") {
+				helperImportOk = true
+			}
+		}
+	}
+
+	results["monochrome_require_duration_match"] = envBoolDefaultTrue("MONOCHROME_REQUIRE_DURATION_MATCH")
+	results["monochrome_duration_tolerance_seconds"] = envIntDefault("MONOCHROME_DURATION_TOLERANCE_SECONDS", 3)
+	results["monochrome_duration_tolerance_percent"] = envIntDefault("MONOCHROME_DURATION_TOLERANCE_PERCENT", 2)
+	results["python_metadata_helper_available"] = helperAvailable
+	results["python_metadata_helper_import_ok"] = helperImportOk
+	results["python_metadata_strategy_detected"] = "graphql (SpotifyMetadataClient)"
 
 	results["go_provider_available"] = true
 
@@ -2659,4 +2789,159 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func absInt64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func fetchExpectedDurationMs(ctx context.Context, spotifyURL string) (int64, error) {
+	pythonBin := filepath.Join(pythonVenvDir, "bin", "python3")
+	if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
+		pythonBin = "python3"
+	}
+
+	helperPath := envStringDefault("PYTHON_METADATA_HELPER_PATH", "/app/scripts/python-provider/metadata.py")
+	if _, err := os.Stat(helperPath); os.IsNotExist(err) {
+		helperPath = "scripts/python-provider/metadata.py"
+		if _, err := os.Stat(helperPath); os.IsNotExist(err) {
+			helperPath = "../scripts/python-provider/metadata.py"
+		}
+	}
+
+	subCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(subCtx, pythonBin, helperPath, "--url", spotifyURL)
+	setProcessGroup(cmd)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	if subCtx.Err() != nil {
+		killProcessGroup(cmd)
+	}
+
+	if err != nil {
+		errMsg := fmt.Sprintf("Python metadata helper execution failed: %v", err)
+		if stderrBuf.Len() > 0 {
+			errMsg = fmt.Sprintf("%s (stderr: %s)", errMsg, strings.TrimSpace(stderrBuf.String()))
+		}
+		return 0, errors.New(errMsg)
+	}
+
+	var result struct {
+		OK         bool   `json:"ok"`
+		DurationMs int64  `json:"duration_ms"`
+		Error      string `json:"error"`
+	}
+
+	if err := json.Unmarshal(stdoutBuf.Bytes(), &result); err != nil {
+		return 0, fmt.Errorf("failed to parse metadata helper JSON: %w (stdout: %s)", err, stdoutBuf.String())
+	}
+
+	if !result.OK {
+		return 0, fmt.Errorf("metadata helper returned error: %s", result.Error)
+	}
+
+	return result.DurationMs, nil
+}
+
+var getAudioDuration = getAudioDurationMs
+
+func getAudioDurationMs(ffprobePath, filePath string) (int64, error) {
+	if ffprobePath == "" {
+		return 0, fmt.Errorf("ffprobe path is empty")
+	}
+	cmd := exec.Command(ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filePath)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("ffprobe failed: %w (stderr: %s)", err, strings.TrimSpace(stderrBuf.String()))
+	}
+	outStr := strings.TrimSpace(stdoutBuf.String())
+	val, err := strconv.ParseFloat(outStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration format %q: %w", outStr, err)
+	}
+	return int64(math.Round(val * 1000)), nil
+}
+
+type monochromeValidationResult struct {
+	OK                  bool
+	ExpectedDurationMs  int64
+	ActualDurationMs    int64
+	DurationMatch       bool
+	DurationToleranceMs int64
+	Err                 error
+}
+
+func validateMonochromeDuration(
+	ffprobePath string,
+	filePath string,
+	expectedDurationMs int64,
+	requireMatch bool,
+	toleranceSeconds int,
+	tolerancePercent int,
+) monochromeValidationResult {
+	res := monochromeValidationResult{
+		ExpectedDurationMs: expectedDurationMs,
+	}
+
+	// 1. Check if expected duration is available
+	if expectedDurationMs <= 0 {
+		res.OK = !requireMatch
+		res.DurationMatch = false
+		if requireMatch {
+			res.Err = fmt.Errorf("monochrome duration validation skipped: expected duration unavailable")
+		}
+		return res
+	}
+
+	// 2. Calculate actual duration using ffprobe
+	actualDurationMs, err := getAudioDuration(ffprobePath, filePath)
+	if err != nil {
+		res.OK = false
+		res.DurationMatch = false
+		res.Err = fmt.Errorf("failed to calculate actual duration: %w", err)
+		return res
+	}
+	res.ActualDurationMs = actualDurationMs
+
+	// 3. Calculate tolerance
+	toleranceMs := maxInt64(
+		int64(toleranceSeconds)*1000,
+		expectedDurationMs*int64(tolerancePercent)/100,
+	)
+	res.DurationToleranceMs = toleranceMs
+
+	// 4. Check difference
+	diff := absInt64(expectedDurationMs - actualDurationMs)
+	if diff <= toleranceMs {
+		res.OK = true
+		res.DurationMatch = true
+	} else {
+		res.DurationMatch = false
+		if requireMatch {
+			res.OK = false
+			res.Err = fmt.Errorf("monochrome duration mismatch: expected %d ms, got %d ms", expectedDurationMs, actualDurationMs)
+		} else {
+			res.OK = true
+		}
+	}
+
+	return res
 }

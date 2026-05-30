@@ -69,7 +69,16 @@ def main():
         track = tracks[0]
 
         # 3. Build providers and run download
-        providers = downloader._build_providers()
+        from SpotiFLAC.downloader import _build_provider
+        providers = []
+        for service_name in opts.services:
+            p = _build_provider(service_name, opts)
+            if p:
+                providers.append(p)
+        if not providers:
+            print_result(False, error=f"No valid providers found in: {opts.services}")
+            return
+
         os.makedirs(args.output_dir, exist_ok=True)
         
         result = download_one(track, args.output_dir, providers, opts)
