@@ -119,3 +119,26 @@ func TestValidateMonochromeDuration(t *testing.T) {
 		t.Errorf("Unexpected error message: %v", res.Err)
 	}
 }
+
+func TestTaskStore(t *testing.T) {
+	store := newTaskStore()
+
+	task := &downloadTask{
+		ID:        "test-task-123",
+		Status:    taskStatusPending,
+		SpotifyID: "spotify-track-xyz",
+	}
+
+	store.put(task)
+
+	retrieved, ok := store.get("test-task-123")
+	if !ok || retrieved.ID != "test-task-123" {
+		t.Errorf("Expected to retrieve task, got ok=%v, task=%v", ok, retrieved)
+	}
+
+	store.delete("test-task-123")
+	_, ok = store.get("test-task-123")
+	if ok {
+		t.Errorf("Expected task to be deleted")
+	}
+}

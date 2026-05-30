@@ -144,6 +144,7 @@ type createDownloadRequest struct {
 	Method     string   `json:"method,omitempty"`
 	Provider   string   `json:"provider,omitempty"`
 	Strategy   string   `json:"strategy,omitempty"`
+	TaskID     string   `json:"task_id,omitempty"`
 }
 
 type createDownloadResponse struct {
@@ -162,6 +163,8 @@ type createDownloadResponse struct {
 	ActualDurationMs    *int64            `json:"actual_duration_ms,omitempty"`
 	DurationMatch       *bool             `json:"duration_match,omitempty"`
 	DurationToleranceMs *int64            `json:"duration_tolerance_ms,omitempty"`
+	TaskID              string            `json:"task_id,omitempty"`
+	Status              string            `json:"status,omitempty"`
 }
 
 type errorResponse struct {
@@ -267,6 +270,7 @@ func (s *downloadStore) startCleanupLoop(ctx context.Context, interval time.Dura
 
 type apiServer struct {
 	store             *downloadStore
+	tasks             *taskStore
 	baseURL           string
 	bindAddr          string
 	ttl               time.Duration
@@ -274,6 +278,85 @@ type apiServer struct {
 	ffmpegAutoInstall bool
 	ffmpegMu          sync.Mutex
 	ffmpegReady       bool
+}
+
+type downloadTaskStatus string
+
+const (
+	taskStatusPending   downloadTaskStatus = "pending"
+	taskStatusRunning   downloadTaskStatus = "running"
+	taskStatusCompleted downloadTaskStatus = "completed"
+	taskStatusFailed    downloadTaskStatus = "failed"
+)
+
+type downloadTask struct {
+	ID        string                  `json:"task_id"`
+	Status    downloadTaskStatus      `json:"status"`
+	SpotifyID string                  `json:"spotify_id,omitempty"`
+	Result    *createDownloadResponse `json:"result,omitempty"`
+	CreatedAt time.Time               `json:"created_at"`
+	ExpiresAt time.Time               `json:"expires_at"`
+}
+
+type taskStore struct {
+	mu    sync.RWMutex
+	tasks map[string]*downloadTask
+}
+
+func newTaskStore() *taskStore {
+	return &taskStore{
+		tasks: make(map[string]*downloadTask),
+	}
+}
+
+func (s *taskStore) put(task *downloadTask) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tasks[task.ID] = task
+}
+
+func (s *taskStore) get(id string) (*downloadTask, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.tasks[id]
+	return t, ok
+}
+
+func (s *taskStore) delete(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tasks, id)
+}
+
+func (s *taskStore) cleanupExpired() {
+	now := time.Now()
+	var expired []string
+
+	s.mu.RLock()
+	for id, t := range s.tasks {
+		if now.After(t.ExpiresAt) {
+			expired = append(expired, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, id := range expired {
+		s.delete(id)
+	}
+}
+
+func (s *taskStore) startCleanupLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupExpired()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func main() {
@@ -315,6 +398,7 @@ func main() {
 
 	server := &apiServer{
 		store:             newDownloadStore(),
+		tasks:             newTaskStore(),
 		baseURL:           strings.TrimSpace(os.Getenv("BASE_URL")),
 		bindAddr:          bindAddr,
 		ttl:               ttl,
@@ -325,6 +409,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go server.store.startCleanupLoop(ctx, 1*time.Minute)
+	go server.tasks.startCleanupLoop(ctx, 1*time.Minute)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
@@ -479,8 +564,6 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	startTime := time.Now()
-
 	var req createDownloadRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
@@ -489,6 +572,37 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// 1. Polling check
+	if req.TaskID != "" {
+		s.tasks.mu.RLock()
+		task, ok := s.tasks.tasks[req.TaskID]
+		s.tasks.mu.RUnlock()
+		if !ok {
+			writeJSON(w, http.StatusNotFound, createDownloadResponse{OK: false, Error: "task not found"})
+			return
+		}
+
+		if task.Status == taskStatusCompleted {
+			resp := *task.Result
+			resp.Status = string(taskStatusCompleted)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		} else if task.Status == taskStatusFailed {
+			resp := *task.Result
+			resp.Status = string(taskStatusFailed)
+			writeJSON(w, http.StatusBadGateway, resp)
+			return
+		} else {
+			writeJSON(w, http.StatusOK, createDownloadResponse{
+				OK:     true,
+				Status: string(task.Status),
+				TaskID: task.ID,
+			})
+			return
+		}
+	}
+
+	// 2. New download request
 	if strings.TrimSpace(req.SpotifyURL) == "" {
 		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: "spotify_url is required"})
 		return
@@ -508,7 +622,10 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	log.Printf("[DOWNLOAD-URL] Resolution started with engine: %s, services: %v", engine, serviceOrder)
+	if err := s.ensureFFmpegBinaries(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, createDownloadResponse{OK: false, Error: err.Error()})
+		return
+	}
 
 	ttl := s.ttl
 	if req.TTLSeconds > 0 {
@@ -519,16 +636,6 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		ttl = override
 	}
 
-	if err := s.ensureFFmpegBinaries(); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, createDownloadResponse{OK: false, Error: err.Error()})
-		return
-	}
-
-	// Determine timeouts (global timeout defaults to 240s)
-	globalTimeoutSecs := envIntDefault("DOWNLOAD_GLOBAL_TIMEOUT_SECONDS", 240)
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(globalTimeoutSecs)*time.Second)
-	defer cancel()
-
 	spotifyID, err := extractSpotifyTrackID(req.SpotifyURL)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: err.Error()})
@@ -536,40 +643,130 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 	}
 
 	spotifyURL := spotifyTrackURLBase + spotifyID
+
+	// Generate task ID
+	taskID, err := generateToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, createDownloadResponse{OK: false, Error: "failed to generate task ID"})
+		return
+	}
+
+	task := &downloadTask{
+		ID:        taskID,
+		Status:    taskStatusPending,
+		SpotifyID: spotifyID,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(1 * time.Hour), // task details expire in 1 hour
+	}
+	s.tasks.put(task)
+
+	baseURL := s.publicBaseURL(r)
+	go s.runDownloadTask(taskID, spotifyID, spotifyURL, serviceOrder, req.Provider, req.Strategy, engine, ttl, baseURL)
+
+	writeJSON(w, http.StatusOK, createDownloadResponse{
+		OK:     true,
+		TaskID: taskID,
+		Status: string(taskStatusPending),
+	})
+}
+
+func (s *apiServer) completeTaskWithError(taskID string, errMsg string, attempts []providerAttempt, startTime time.Time) {
+	elapsedMs := time.Since(startTime).Milliseconds()
+	s.tasks.mu.Lock()
+	defer s.tasks.mu.Unlock()
+	task, ok := s.tasks.tasks[taskID]
+	if ok {
+		task.Status = taskStatusFailed
+		task.Result = &createDownloadResponse{
+			OK:         false,
+			Error:      errMsg,
+			Attempts:   attempts,
+			DurationMs: elapsedMs,
+		}
+	}
+}
+
+func (s *apiServer) completeTaskWithSuccess(taskID string, res downloadResult, entry downloadEntry, downloadURL string, startTime time.Time) {
+	elapsedMs := time.Since(startTime).Milliseconds()
+	s.tasks.mu.Lock()
+	defer s.tasks.mu.Unlock()
+	task, ok := s.tasks.tasks[taskID]
+	if ok {
+		task.Status = taskStatusCompleted
+		task.Result = &createDownloadResponse{
+			OK:                  true,
+			SpotifyID:           task.SpotifyID,
+			Service:             res.ServiceUsed,
+			Method:              res.MethodUsed,
+			Filename:            filepath.Base(entry.Path),
+			DownloadURL:         downloadURL,
+			ExpiresAt:           entry.ExpiresAt.UTC(),
+			Attempts:            res.Attempts,
+			Provider:            res.ProviderName,
+			DurationMs:          elapsedMs,
+			ExpectedDurationMs:  res.ExpectedDurationMs,
+			ActualDurationMs:    res.ActualDurationMs,
+			DurationMatch:       res.DurationMatch,
+			DurationToleranceMs: res.DurationToleranceMs,
+		}
+	}
+}
+
+func (s *apiServer) runDownloadTask(
+	taskID string,
+	spotifyID string,
+	spotifyURL string,
+	serviceOrder []string,
+	requestedProvider string,
+	requestedStrategy string,
+	engine string,
+	ttl time.Duration,
+	baseURL string,
+) {
+	s.tasks.mu.Lock()
+	task, ok := s.tasks.tasks[taskID]
+	if ok {
+		task.Status = taskStatusRunning
+	}
+	s.tasks.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	globalTimeoutSecs := envIntDefault("DOWNLOAD_GLOBAL_TIMEOUT_SECONDS", 240)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(globalTimeoutSecs)*time.Second)
+	defer cancel()
+
+	startTime := time.Now()
+
+	// 1. Fetch track metadata
 	meta, err := fetchTrackMetadata(spotifyURL)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
-			OK:    false,
-			Error: fmt.Sprintf("failed to fetch Spotify metadata: %v", err),
-		})
+		s.completeTaskWithError(taskID, fmt.Sprintf("failed to fetch Spotify metadata: %v", err), nil, startTime)
 		return
 	}
 
+	// 2. Fetch expected duration
 	expectedDurationMs, metadataErr := fetchExpectedDurationMs(ctx, spotifyURL)
 	if metadataErr != nil {
-		log.Printf("[DOWNLOAD-URL] Warning: failed to fetch expected duration: %v", metadataErr)
-	} else {
-		log.Printf("[DOWNLOAD-URL] Fetched expected duration: %d ms", expectedDurationMs)
+		log.Printf("[TASK-%s] Warning: failed to fetch expected duration: %v", taskID, metadataErr)
 	}
 
+	// 3. Create temp directory
 	workDir, err := os.MkdirTemp("", "spotiflac-rest-")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, createDownloadResponse{
-			OK:    false,
-			Error: fmt.Sprintf("failed to create temp directory: %v", err),
-		})
+		s.completeTaskWithError(taskID, fmt.Sprintf("failed to create temp directory: %v", err), nil, startTime)
 		return
 	}
 
-	// Determine providers and strategy based on the request & configurations
-	providers, strategy, err := s.getProvidersForRequest(req.Provider, req.Strategy, engine)
+	// 4. Determine providers and strategy
+	providers, strategy, err := s.getProvidersForRequest(requestedProvider, requestedStrategy, engine)
 	if err != nil {
 		_ = os.RemoveAll(workDir)
-		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: err.Error()})
+		s.completeTaskWithError(taskID, err.Error(), nil, startTime)
 		return
 	}
-
-	log.Printf("[DOWNLOAD-URL] Using strategy: %s with providers: %v", strategy, providers)
 
 	dlReq := downloadRequest{
 		SpotifyID:          spotifyID,
@@ -606,12 +803,7 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		// Done
 	case <-ctx.Done():
 		_ = os.RemoveAll(workDir)
-		elapsedMs := time.Since(startTime).Milliseconds()
-		log.Printf("[DOWNLOAD-URL] Request timed out after %d ms (limit: %ds)", elapsedMs, globalTimeoutSecs)
-		writeJSON(w, http.StatusGatewayTimeout, createDownloadResponse{
-			OK:    false,
-			Error: fmt.Sprintf("request timed out after %ds", globalTimeoutSecs),
-		})
+		s.completeTaskWithError(taskID, fmt.Sprintf("request timed out after %ds", globalTimeoutSecs), nil, startTime)
 		return
 	}
 
@@ -619,21 +811,7 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 
 	if !res.OK {
 		_ = os.RemoveAll(workDir)
-		elapsedMs := time.Since(startTime).Milliseconds()
-		log.Printf("[DOWNLOAD-URL] Request failed after %d ms: %s", elapsedMs, res.Error)
-		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
-			OK:                  false,
-			Error:               res.Error,
-			Attempts:            res.Attempts,
-			DurationMs:          elapsedMs,
-			Provider:            res.ProviderName,
-			Service:             res.ServiceUsed,
-			Method:              res.MethodUsed,
-			ExpectedDurationMs:  res.ExpectedDurationMs,
-			ActualDurationMs:    res.ActualDurationMs,
-			DurationMatch:       res.DurationMatch,
-			DurationToleranceMs: res.DurationToleranceMs,
-		})
+		s.completeTaskWithError(taskID, res.Error, res.Attempts, startTime)
 		return
 	}
 
@@ -641,30 +819,12 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 	entry, err := s.store.put(res.FilePath, res.ServiceUsed, spotifyID, ttl)
 	if err != nil {
 		_ = os.RemoveAll(workDir)
-		writeJSON(w, http.StatusInternalServerError, createDownloadResponse{OK: false, Error: "failed to generate download token"})
+		s.completeTaskWithError(taskID, "failed to generate download token", res.Attempts, startTime)
 		return
 	}
 
-	downloadURL := fmt.Sprintf("%s/v1/download/%s", s.publicBaseURL(r), entry.Token)
-	elapsedMs := time.Since(startTime).Milliseconds()
-	log.Printf("[DOWNLOAD-URL] Request completed in %d ms (download_url: %s)", elapsedMs, downloadURL)
-
-	writeJSON(w, http.StatusOK, createDownloadResponse{
-		OK:                  true,
-		SpotifyID:           spotifyID,
-		Service:             res.ServiceUsed,
-		Method:              res.MethodUsed,
-		Filename:            filepath.Base(entry.Path),
-		DownloadURL:         downloadURL,
-		ExpiresAt:           entry.ExpiresAt.UTC(),
-		Attempts:            res.Attempts,
-		Provider:            res.ProviderName,
-		DurationMs:          elapsedMs,
-		ExpectedDurationMs:  res.ExpectedDurationMs,
-		ActualDurationMs:    res.ActualDurationMs,
-		DurationMatch:       res.DurationMatch,
-		DurationToleranceMs: res.DurationToleranceMs,
-	})
+	downloadURL := fmt.Sprintf("%s/v1/download/%s", strings.TrimSuffix(baseURL, "/"), entry.Token)
+	s.completeTaskWithSuccess(taskID, res, entry, downloadURL, startTime)
 }
 
 // --- Provider Abstraction & Management ---
