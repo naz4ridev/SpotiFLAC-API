@@ -3,3 +3,5 @@ spotiflacapi
 .gocache/
 .gomodcache/
 .env
+scratch/
+
