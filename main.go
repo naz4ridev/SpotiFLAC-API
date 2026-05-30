@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,20 +64,21 @@ var validDownloadEngines = map[string]struct{}{
 }
 
 var defaultMonochromeAPIInstances = []string{
-	"https://monochrome-api.samidy.com",
-	"https://api.monochrome.tf",
 	"https://hifi.geeked.wtf",
-	"https://wolf.qqdl.site",
+	"https://eu-central.monochrome.tf",
+	"https://us-west.monochrome.tf",
+	"https://api.monochrome.tf",
+	"https://monochrome-api.samidy.com",
 	"https://maus.qqdl.site",
 	"https://vogel.qqdl.site",
 	"https://katze.qqdl.site",
 	"https://hund.qqdl.site",
 	"https://tidal.kinoplus.online",
+	"https://wolf.qqdl.site",
 }
 
 var defaultMonochromeDiscoveryURLs = []string{
-	"https://tidal-uptime.jiffy-puffs-1j.workers.dev/",
-	"https://tidal-uptime.props-76styles.workers.dev/",
+	"https://tidal-uptime.geeked.wtf/",
 }
 
 var defaultMonochromeStreamingInstances = []string{
@@ -253,6 +255,18 @@ type apiServer struct {
 }
 
 func main() {
+	// Prepend custom FFMPEG_PATH and FFPROBE_PATH directories to system PATH to force package-level resolution.
+	for _, envVar := range []string{"FFMPEG_PATH", "FFPROBE_PATH"} {
+		if pathVal := strings.TrimSpace(os.Getenv(envVar)); pathVal != "" {
+			dir := filepath.Dir(pathVal)
+			if dir != "." && dir != "/" {
+				currentPath := os.Getenv("PATH")
+				os.Setenv("PATH", dir+string(os.PathListSeparator)+currentPath)
+				log.Printf("Prepended %s dir to PATH: %s", envVar, dir)
+			}
+		}
+	}
+
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "8080"
@@ -292,6 +306,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
+	mux.HandleFunc("/v1/diagnostics", server.handleDiagnostics)
 	mux.HandleFunc("/v1/download-url", server.handleCreateDownloadURL)
 	mux.HandleFunc("/v1/download/", server.handleDownloadByToken)
 	mux.HandleFunc("/", server.handleRoot)
@@ -335,11 +350,112 @@ func (s *apiServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *apiServer) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	isLocalhost := err == nil && (remoteIP == "127.0.0.1" || remoteIP == "::1" || remoteIP == "localhost")
+
+	token := r.Header.Get("X-Diagnostics-Token")
+	expectedToken := strings.TrimSpace(os.Getenv("DIAGNOSTICS_TOKEN"))
+	isValidToken := expectedToken != "" && token == expectedToken
+
+	if !isLocalhost && !isValidToken {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	type checkResult struct {
+		OK      bool   `json:"ok"`
+		Details string `json:"details,omitempty"`
+	}
+
+	results := make(map[string]checkResult)
+	allOK := true
+
+	// Check ffmpeg
+	ffmpegPath, err := backend.GetFFmpegPath()
+	if err != nil {
+		results["ffmpeg"] = checkResult{OK: false, Details: err.Error()}
+		allOK = false
+	} else {
+		cmd := exec.Command(ffmpegPath, "-version")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			results["ffmpeg"] = checkResult{OK: false, Details: fmt.Sprintf("failed to run: %v", err)}
+			allOK = false
+		} else {
+			firstLine := strings.Split(out.String(), "\n")[0]
+			results["ffmpeg"] = checkResult{OK: true, Details: fmt.Sprintf("path: %s, version: %s", ffmpegPath, firstLine)}
+		}
+	}
+
+	// Check ffprobe
+	ffprobePath, err := backend.GetFFprobePath()
+	if err != nil {
+		results["ffprobe"] = checkResult{OK: false, Details: err.Error()}
+		allOK = false
+	} else {
+		cmd := exec.Command(ffprobePath, "-version")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			results["ffprobe"] = checkResult{OK: false, Details: fmt.Sprintf("failed to run: %v", err)}
+			allOK = false
+		} else {
+			firstLine := strings.Split(out.String(), "\n")[0]
+			results["ffprobe"] = checkResult{OK: true, Details: fmt.Sprintf("path: %s, version: %s", ffprobePath, firstLine)}
+		}
+	}
+
+	// Check external endpoints
+	endpoints := []string{
+		"tidal.kinoplus.online",
+		"qbz.afkarxyz.qzz.io",
+		"amzn.afkarxyz.qzz.io",
+		"api.spotify.com",
+	}
+
+	for _, host := range endpoints {
+		// DNS check
+		addrs, err := net.LookupHost(host)
+		if err != nil || len(addrs) == 0 {
+			results[host+"_dns"] = checkResult{OK: false, Details: fmt.Sprintf("DNS lookup failed: %v", err)}
+			allOK = false
+			continue
+		}
+		results[host+"_dns"] = checkResult{OK: true, Details: strings.Join(addrs, ", ")}
+
+		// TCP connectivity to 443
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, "443"), 3*time.Second)
+		if err != nil {
+			results[host+"_tcp"] = checkResult{OK: false, Details: fmt.Sprintf("TCP 443 failed: %v", err)}
+			allOK = false
+		} else {
+			_ = conn.Close()
+			results[host+"_tcp"] = checkResult{OK: true, Details: "connected"}
+		}
+	}
+
+	status := http.StatusOK
+	if !allOK {
+		status = http.StatusServiceUnavailable
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":      allOK,
+		"results": results,
+	})
+}
+
 func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{OK: false, Error: "method not allowed"})
 		return
 	}
+
+	startTime := time.Now()
 
 	var req createDownloadRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
@@ -354,6 +470,8 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	log.Printf("[DOWNLOAD-URL] Request received for URL: %s", req.SpotifyURL)
+
 	engine, err := requestedDownloadEngine(req, r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: err.Error()})
@@ -365,6 +483,8 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: "no valid services in services[]"})
 		return
 	}
+
+	log.Printf("[DOWNLOAD-URL] Resolution started with engine: %s, services: %v", engine, serviceOrder)
 
 	ttl := s.ttl
 	if req.TTLSeconds > 0 {
@@ -380,32 +500,77 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	downloadPath, serviceUsed, methodUsed, spotifyID, attempts, err := s.resolveDownload(req.SpotifyURL, serviceOrder, engine)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
-			OK:       false,
-			Error:    err.Error(),
-			Attempts: attempts,
+	// Dynamic internal timeout (default: 180s)
+	timeoutSecs := envIntDefault("DOWNLOAD_URL_TIMEOUT_SECONDS", 180)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	type resolveResult struct {
+		downloadPath string
+		serviceUsed  string
+		methodUsed   string
+		spotifyID    string
+		attempts     []attempt
+		err          error
+	}
+
+	resultChan := make(chan resolveResult, 1)
+	go func() {
+		downloadPath, serviceUsed, methodUsed, spotifyID, attempts, err := s.resolveDownload(ctx, req.SpotifyURL, serviceOrder, engine)
+		resultChan <- resolveResult{
+			downloadPath: downloadPath,
+			serviceUsed:  serviceUsed,
+			methodUsed:   methodUsed,
+			spotifyID:    spotifyID,
+			attempts:     attempts,
+			err:          err,
+		}
+	}()
+
+	var res resolveResult
+	select {
+	case res = <-resultChan:
+		// Done
+	case <-ctx.Done():
+		elapsedMs := time.Since(startTime).Milliseconds()
+		log.Printf("[DOWNLOAD-URL] Request timed out after %d ms (limit: %ds)", elapsedMs, timeoutSecs)
+		writeJSON(w, http.StatusGatewayTimeout, errorResponse{
+			OK:    false,
+			Error: fmt.Sprintf("request timed out after %ds", timeoutSecs),
 		})
 		return
 	}
 
-	entry, err := s.store.put(downloadPath, serviceUsed, spotifyID, ttl)
+	if res.err != nil {
+		elapsedMs := time.Since(startTime).Milliseconds()
+		log.Printf("[DOWNLOAD-URL] Request failed after %d ms: %v", elapsedMs, res.err)
+		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
+			OK:       false,
+			Error:    res.err.Error(),
+			Attempts: res.attempts,
+		})
+		return
+	}
+
+	entry, err := s.store.put(res.downloadPath, res.serviceUsed, res.spotifyID, ttl)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{OK: false, Error: "failed to generate download token"})
 		return
 	}
 
 	downloadURL := fmt.Sprintf("%s/v1/download/%s", s.publicBaseURL(r), entry.Token)
+	elapsedMs := time.Since(startTime).Milliseconds()
+	log.Printf("[DOWNLOAD-URL] Request completed in %d ms (download_url: %s)", elapsedMs, downloadURL)
+
 	writeJSON(w, http.StatusOK, createDownloadResponse{
 		OK:          true,
-		SpotifyID:   spotifyID,
-		Service:     serviceUsed,
-		Method:      methodUsed,
+		SpotifyID:   res.spotifyID,
+		Service:     res.serviceUsed,
+		Method:      res.methodUsed,
 		Filename:    filepath.Base(entry.Path),
 		DownloadURL: downloadURL,
 		ExpiresAt:   entry.ExpiresAt.UTC(),
-		Attempts:    attempts,
+		Attempts:    res.attempts,
 	})
 }
 
@@ -566,7 +731,7 @@ func requestedDownloadEngine(req createDownloadRequest, r *http.Request) (string
 	return engine, nil
 }
 
-func (s *apiServer) resolveDownload(spotifyInput string, serviceOrder []string, engine string) (downloadPath, serviceUsed, methodUsed, spotifyID string, attempts []attempt, err error) {
+func (s *apiServer) resolveDownload(ctx context.Context, spotifyInput string, serviceOrder []string, engine string) (downloadPath, serviceUsed, methodUsed, spotifyID string, attempts []attempt, err error) {
 	spotifyID, err = extractSpotifyTrackID(spotifyInput)
 	if err != nil {
 		return "", "", "", "", nil, err
@@ -598,7 +763,7 @@ func (s *apiServer) resolveDownload(spotifyInput string, serviceOrder []string, 
 		cleanupWorkDir = false
 		return downloadPath, serviceUsed, downloadEngineSpotiFLAC, spotifyID, attempts, nil
 	case downloadEngineMonochrome:
-		downloadPath, attempts, err = s.resolveWithMonochrome(meta, workDir)
+		downloadPath, attempts, err = s.resolveWithMonochrome(ctx, meta, workDir)
 		if err != nil {
 			return "", "", "", spotifyID, attempts, err
 		}
@@ -611,7 +776,7 @@ func (s *apiServer) resolveDownload(spotifyInput string, serviceOrder []string, 
 			return downloadPath, serviceUsed, downloadEngineSpotiFLAC, spotifyID, attempts, nil
 		}
 
-		monochromePath, monochromeAttempts, monochromeErr := s.resolveWithMonochrome(meta, workDir)
+		monochromePath, monochromeAttempts, monochromeErr := s.resolveWithMonochrome(ctx, meta, workDir)
 		attempts = append(attempts, monochromeAttempts...)
 		if monochromeErr == nil {
 			cleanupWorkDir = false
@@ -654,10 +819,8 @@ func (s *apiServer) resolveWithSpotiFLAC(spotifyID, spotifyURL string, meta trac
 	return "", "", attempts, fmt.Errorf("failed in all services: %s", strings.Join(serviceOrder, " -> "))
 }
 
-func (s *apiServer) resolveWithMonochrome(meta trackMetadata, workDir string) (string, []attempt, error) {
+func (s *apiServer) resolveWithMonochrome(ctx context.Context, meta trackMetadata, workDir string) (string, []attempt, error) {
 	attempts := make([]attempt, 0, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 
 	client := newMonochromeClient(s.httpClient)
 	track, err := client.searchTrack(ctx, meta)
@@ -1295,6 +1458,7 @@ func downloadMonochromeTrack(ctx context.Context, manifestURI, outputPath string
 	args := []string{
 		"-y",
 		"-loglevel", "error",
+		"-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
 		"-i", input,
 		"-vn",
 		"-map", "0:a:0",
@@ -1409,6 +1573,19 @@ func envStringDefault(name, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envIntDefault(key string, defaultVal int) int {
+	valStr := strings.TrimSpace(os.Getenv(key))
+	if valStr == "" {
+		return defaultVal
+	}
+	val, err := strconv.Atoi(valStr)
+	if err != nil {
+		log.Printf("Warning: invalid int value for %s: %s (using default %d)", key, valStr, defaultVal)
+		return defaultVal
+	}
+	return val
 }
 
 func envDurationDefault(name string, fallback time.Duration) time.Duration {
