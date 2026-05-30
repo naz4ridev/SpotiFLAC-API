@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/afkarxyz/SpotiFLAC/backend"
@@ -122,30 +123,42 @@ type attempt struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type providerAttempt struct {
+	Provider        string    `json:"provider"`
+	OK              bool      `json:"ok"`
+	DurationMs      int64     `json:"duration_ms"`
+	Error           string    `json:"error,omitempty"`
+	ServiceAttempts []attempt `json:"service_attempts,omitempty"`
+}
+
 type createDownloadRequest struct {
 	SpotifyURL string   `json:"spotify_url"`
 	Services   []string `json:"services,omitempty"`
 	TTLSeconds int      `json:"ttl_seconds,omitempty"`
 	Engine     string   `json:"engine,omitempty"`
 	Method     string   `json:"method,omitempty"`
+	Provider   string   `json:"provider,omitempty"`
+	Strategy   string   `json:"strategy,omitempty"`
 }
 
 type createDownloadResponse struct {
-	OK          bool      `json:"ok"`
-	SpotifyID   string    `json:"spotify_id,omitempty"`
-	Service     string    `json:"service,omitempty"`
-	Method      string    `json:"method,omitempty"`
-	Filename    string    `json:"filename,omitempty"`
-	DownloadURL string    `json:"download_url,omitempty"`
-	ExpiresAt   time.Time `json:"expires_at,omitempty"`
-	Attempts    []attempt `json:"attempts,omitempty"`
-	Error       string    `json:"error,omitempty"`
+	OK          bool              `json:"ok"`
+	SpotifyID   string            `json:"spotify_id,omitempty"`
+	Service     string            `json:"service,omitempty"`
+	Method      string            `json:"method,omitempty"`
+	Filename    string            `json:"filename,omitempty"`
+	DownloadURL string            `json:"download_url,omitempty"`
+	ExpiresAt   time.Time         `json:"expires_at,omitempty"`
+	Attempts    []providerAttempt `json:"attempts,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Provider    string            `json:"provider,omitempty"`
+	DurationMs  int64             `json:"duration_ms,omitempty"`
 }
 
 type errorResponse struct {
-	OK       bool      `json:"ok"`
-	Error    string    `json:"error"`
-	Attempts []attempt `json:"attempts,omitempty"`
+	OK       bool              `json:"ok"`
+	Error    string            `json:"error"`
+	Attempts []providerAttempt `json:"attempts,omitempty"`
 }
 
 type downloadEntry struct {
@@ -307,6 +320,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
 	mux.HandleFunc("/v1/diagnostics", server.handleDiagnostics)
+	mux.HandleFunc("/diagnostics/providers", server.handleDiagnosticsProviders)
+	mux.HandleFunc("/internal/warmup", server.handleWarmup)
 	mux.HandleFunc("/v1/download-url", server.handleCreateDownloadURL)
 	mux.HandleFunc("/v1/download/", server.handleDownloadByToken)
 	mux.HandleFunc("/", server.handleRoot)
@@ -451,7 +466,7 @@ func (s *apiServer) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{OK: false, Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, createDownloadResponse{OK: false, Error: "method not allowed"})
 		return
 	}
 
@@ -461,12 +476,12 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: "invalid JSON body"})
+		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: "invalid JSON body"})
 		return
 	}
 
 	if strings.TrimSpace(req.SpotifyURL) == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: "spotify_url is required"})
+		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: "spotify_url is required"})
 		return
 	}
 
@@ -474,13 +489,13 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 
 	engine, err := requestedDownloadEngine(req, r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: err.Error()})
+		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: err.Error()})
 		return
 	}
 
 	serviceOrder := normalizeServiceOrder(req.Services)
 	if len(serviceOrder) == 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: "no valid services in services[]"})
+		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: "no valid services in services[]"})
 		return
 	}
 
@@ -496,65 +511,113 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := s.ensureFFmpegBinaries(); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{OK: false, Error: err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, createDownloadResponse{OK: false, Error: err.Error()})
 		return
 	}
 
-	// Dynamic internal timeout (default: 180s)
-	timeoutSecs := envIntDefault("DOWNLOAD_URL_TIMEOUT_SECONDS", 180)
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSecs)*time.Second)
+	// Determine timeouts (global timeout defaults to 240s)
+	globalTimeoutSecs := envIntDefault("DOWNLOAD_GLOBAL_TIMEOUT_SECONDS", 240)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(globalTimeoutSecs)*time.Second)
 	defer cancel()
 
-	type resolveResult struct {
-		downloadPath string
-		serviceUsed  string
-		methodUsed   string
-		spotifyID    string
-		attempts     []attempt
-		err          error
+	spotifyID, err := extractSpotifyTrackID(req.SpotifyURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: err.Error()})
+		return
 	}
 
-	resultChan := make(chan resolveResult, 1)
+	spotifyURL := spotifyTrackURLBase + spotifyID
+	meta, err := fetchTrackMetadata(spotifyURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
+			OK:    false,
+			Error: fmt.Sprintf("failed to fetch Spotify metadata: %v", err),
+		})
+		return
+	}
+
+	workDir, err := os.MkdirTemp("", "spotiflac-rest-")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, createDownloadResponse{
+			OK:    false,
+			Error: fmt.Sprintf("failed to create temp directory: %v", err),
+		})
+		return
+	}
+
+	// Determine providers and strategy based on the request & configurations
+	providers, strategy, err := s.getProvidersForRequest(req.Provider, req.Strategy, engine)
+	if err != nil {
+		_ = os.RemoveAll(workDir)
+		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	log.Printf("[DOWNLOAD-URL] Using strategy: %s with providers: %v", strategy, providers)
+
+	dlReq := downloadRequest{
+		SpotifyID:    spotifyID,
+		SpotifyURL:   spotifyURL,
+		Metadata:     meta,
+		ServiceOrder: serviceOrder,
+		OutputDir:    workDir,
+	}
+
+	manager := NewProviderManager(providers, strategy)
+
+	type managerResult struct {
+		res downloadResult
+	}
+
+	managerChan := make(chan managerResult, 1)
 	go func() {
-		downloadPath, serviceUsed, methodUsed, spotifyID, attempts, err := s.resolveDownload(ctx, req.SpotifyURL, serviceOrder, engine)
-		resultChan <- resolveResult{
-			downloadPath: downloadPath,
-			serviceUsed:  serviceUsed,
-			methodUsed:   methodUsed,
-			spotifyID:    spotifyID,
-			attempts:     attempts,
-			err:          err,
+		var res downloadResult
+		switch strategy {
+		case "single":
+			res = manager.runSingle(ctx, dlReq)
+		case "fallback":
+			res = manager.runFallback(ctx, dlReq)
+		case "race":
+			res = manager.runRace(ctx, dlReq)
 		}
+		managerChan <- managerResult{res: res}
 	}()
 
-	var res resolveResult
+	var mRes managerResult
 	select {
-	case res = <-resultChan:
+	case mRes = <-managerChan:
 		// Done
 	case <-ctx.Done():
+		_ = os.RemoveAll(workDir)
 		elapsedMs := time.Since(startTime).Milliseconds()
-		log.Printf("[DOWNLOAD-URL] Request timed out after %d ms (limit: %ds)", elapsedMs, timeoutSecs)
-		writeJSON(w, http.StatusGatewayTimeout, errorResponse{
+		log.Printf("[DOWNLOAD-URL] Request timed out after %d ms (limit: %ds)", elapsedMs, globalTimeoutSecs)
+		writeJSON(w, http.StatusGatewayTimeout, createDownloadResponse{
 			OK:    false,
-			Error: fmt.Sprintf("request timed out after %ds", timeoutSecs),
+			Error: fmt.Sprintf("request timed out after %ds", globalTimeoutSecs),
 		})
 		return
 	}
 
-	if res.err != nil {
+	res := mRes.res
+
+	if !res.OK {
+		_ = os.RemoveAll(workDir)
 		elapsedMs := time.Since(startTime).Milliseconds()
-		log.Printf("[DOWNLOAD-URL] Request failed after %d ms: %v", elapsedMs, res.err)
+		log.Printf("[DOWNLOAD-URL] Request failed after %d ms: %s", elapsedMs, res.Error)
 		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
-			OK:       false,
-			Error:    res.err.Error(),
-			Attempts: res.attempts,
+			OK:         false,
+			Error:      res.Error,
+			Attempts:   res.Attempts,
+			DurationMs: elapsedMs,
 		})
 		return
 	}
 
-	entry, err := s.store.put(res.downloadPath, res.serviceUsed, res.spotifyID, ttl)
+	// Register file in store
+	entry, err := s.store.put(res.FilePath, res.ServiceUsed, spotifyID, ttl)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{OK: false, Error: "failed to generate download token"})
+		_ = os.RemoveAll(workDir)
+		writeJSON(w, http.StatusInternalServerError, createDownloadResponse{OK: false, Error: "failed to generate download token"})
 		return
 	}
 
@@ -564,15 +627,683 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 
 	writeJSON(w, http.StatusOK, createDownloadResponse{
 		OK:          true,
-		SpotifyID:   res.spotifyID,
-		Service:     res.serviceUsed,
-		Method:      res.methodUsed,
+		SpotifyID:   spotifyID,
+		Service:     res.ServiceUsed,
+		Method:      res.MethodUsed,
 		Filename:    filepath.Base(entry.Path),
 		DownloadURL: downloadURL,
 		ExpiresAt:   entry.ExpiresAt.UTC(),
-		Attempts:    res.attempts,
+		Attempts:    res.Attempts,
+		Provider:    res.ProviderName,
+		DurationMs:  elapsedMs,
 	})
 }
+
+// --- Provider Abstraction & Management ---
+
+var (
+	downloadProviders            = splitCSVEnv("DOWNLOAD_PROVIDERS", []string{"go", "python"})
+	defaultDownloadProviderOrder = splitCSVEnv("DEFAULT_DOWNLOAD_PROVIDER_ORDER", []string{"go", "python"})
+	downloadStrategy             = envStringDefault("DOWNLOAD_STRATEGY", "race")
+	pythonProviderEnabled        = envBoolDefaultTrue("PYTHON_PROVIDER_ENABLED")
+	pythonVenvDir                = envStringDefault("PYTHON_VENV_DIR", "/opt/python-spotiflac-venv")
+	pythonSrcDir                 = envStringDefault("PYTHON_SRC_DIR", "/opt/python-spotiflac-src")
+	pythonWrapperPath            = envStringDefault("PYTHON_WRAPPER_PATH", "/app/scripts/python-provider/download.py")
+)
+
+type downloadRequest struct {
+	SpotifyID    string
+	SpotifyURL   string
+	Metadata     trackMetadata
+	ServiceOrder []string
+	OutputDir    string
+}
+
+type downloadResult struct {
+	OK           bool
+	FilePath     string
+	ProviderName string
+	ServiceUsed  string
+	MethodUsed   string
+	DurationMs   int64
+	Attempts     []providerAttempt
+	Error        string
+}
+
+type DownloadProvider interface {
+	Name() string
+	Download(ctx context.Context, req downloadRequest) downloadResult
+}
+
+// 1. Go Provider Implementation
+type GoProvider struct {
+	server *apiServer
+	engine string
+}
+
+func (p *GoProvider) Name() string {
+	return "go"
+}
+
+func (p *GoProvider) Download(ctx context.Context, req downloadRequest) downloadResult {
+	startTime := time.Now()
+	res := downloadResult{
+		ProviderName: "go",
+	}
+
+	var downloadPath string
+	var serviceUsed string
+	var attempts []attempt
+	var err error
+
+	switch p.engine {
+	case downloadEngineSpotiFLAC:
+		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
+		res.MethodUsed = downloadEngineSpotiFLAC
+	case downloadEngineMonochrome:
+		downloadPath, attempts, err = p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
+		res.MethodUsed = downloadEngineMonochrome
+		serviceUsed = downloadEngineMonochrome
+	default:
+		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
+		res.MethodUsed = downloadEngineSpotiFLAC
+		if err != nil {
+			var monochromeAttempts []attempt
+			var monochromeErr error
+			var monochromePath string
+			monochromePath, monochromeAttempts, monochromeErr = p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
+			attempts = append(attempts, monochromeAttempts...)
+			if monochromeErr == nil {
+				downloadPath = monochromePath
+				serviceUsed = downloadEngineMonochrome
+				res.MethodUsed = downloadEngineMonochrome
+				err = nil
+			} else {
+				err = fmt.Errorf("spotiflac failed: %v; monochrome failed: %w", err, monochromeErr)
+			}
+		}
+	}
+
+	durationMs := time.Since(startTime).Milliseconds()
+	if err == nil {
+		res.OK = true
+		res.FilePath = downloadPath
+		res.ServiceUsed = serviceUsed
+		res.Attempts = []providerAttempt{
+			{
+				Provider:        "go",
+				OK:              true,
+				DurationMs:      durationMs,
+				ServiceAttempts: attempts,
+			},
+		}
+	} else {
+		res.OK = false
+		res.Error = err.Error()
+		res.Attempts = []providerAttempt{
+			{
+				Provider:        "go",
+				OK:              false,
+				DurationMs:      durationMs,
+				Error:           err.Error(),
+				ServiceAttempts: attempts,
+			},
+		}
+	}
+	res.DurationMs = durationMs
+	return res
+}
+
+// 2. Python Provider Implementation
+type PythonProvider struct {
+	pythonVenvDir string
+	wrapperPath   string
+}
+
+func (p *PythonProvider) Name() string {
+	return "python"
+}
+
+func (p *PythonProvider) Download(ctx context.Context, req downloadRequest) downloadResult {
+	startTime := time.Now()
+	res := downloadResult{
+		ProviderName: "python",
+	}
+
+	pythonBin := filepath.Join(p.pythonVenvDir, "bin", "python3")
+	if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
+		pythonBin = "python3"
+	}
+
+	timeoutSecs := envIntDefault("PYTHON_PROVIDER_TIMEOUT_SECONDS", 180)
+	subCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(subCtx, pythonBin, p.wrapperPath,
+		"--url", req.SpotifyURL,
+		"--output-dir", req.OutputDir,
+		"--timeout", strconv.Itoa(timeoutSecs),
+	)
+
+	setProcessGroup(cmd)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	durationMs := time.Since(startTime).Milliseconds()
+
+	if subCtx.Err() != nil {
+		killProcessGroup(cmd)
+	}
+
+	if err != nil {
+		errMsg := fmt.Sprintf("Python execution failed: %v", err)
+		if stderrBuf.Len() > 0 {
+			stderrStr := stderrBuf.String()
+			if len(stderrStr) > 500 {
+				stderrStr = stderrStr[:500] + "... [truncated]"
+			}
+			errMsg = fmt.Sprintf("%s. Stderr: %s", errMsg, strings.TrimSpace(stderrStr))
+		}
+		res.OK = false
+		res.Error = errMsg
+		res.Attempts = []providerAttempt{
+			{
+				Provider:   "python",
+				OK:         false,
+				DurationMs: durationMs,
+				Error:      errMsg,
+			},
+		}
+		res.DurationMs = durationMs
+		return res
+	}
+
+	var wrapperOut struct {
+		OK       bool   `json:"ok"`
+		FilePath string `json:"file_path"`
+		Error    string `json:"error"`
+	}
+
+	if err := json.Unmarshal(stdoutBuf.Bytes(), &wrapperOut); err != nil {
+		errMsg := fmt.Sprintf("failed to parse python wrapper JSON: %v. Raw stdout: %s", err, stdoutBuf.String())
+		res.OK = false
+		res.Error = errMsg
+		res.Attempts = []providerAttempt{
+			{
+				Provider:   "python",
+				OK:         false,
+				DurationMs: durationMs,
+				Error:      errMsg,
+			},
+		}
+		res.DurationMs = durationMs
+		return res
+	}
+
+	if !wrapperOut.OK {
+		res.OK = false
+		res.Error = wrapperOut.Error
+		res.Attempts = []providerAttempt{
+			{
+				Provider:   "python",
+				OK:         false,
+				DurationMs: durationMs,
+				Error:      wrapperOut.Error,
+			},
+		}
+		res.DurationMs = durationMs
+		return res
+	}
+
+	if !isValidDownloadedFile(wrapperOut.FilePath) {
+		errMsg := "Python download returned invalid/corrupt audio file"
+		res.OK = false
+		res.Error = errMsg
+		res.Attempts = []providerAttempt{
+			{
+				Provider:   "python",
+				OK:         false,
+				DurationMs: durationMs,
+				Error:      errMsg,
+			},
+		}
+		res.DurationMs = durationMs
+		return res
+	}
+
+	res.OK = true
+	res.FilePath = wrapperOut.FilePath
+	res.MethodUsed = "python"
+	res.ServiceUsed = "python"
+	res.Attempts = []providerAttempt{
+		{
+			Provider:   "python",
+			OK:         true,
+			DurationMs: durationMs,
+		},
+	}
+	res.DurationMs = durationMs
+	return res
+}
+
+// 3. Provider Manager Implementation
+type ProviderManager struct {
+	providers []DownloadProvider
+	strategy  string
+}
+
+func NewProviderManager(providers []DownloadProvider, strategy string) *ProviderManager {
+	return &ProviderManager{
+		providers: providers,
+		strategy:  strategy,
+	}
+}
+
+func (m *ProviderManager) runSingle(ctx context.Context, req downloadRequest) downloadResult {
+	startTime := time.Now()
+	if len(m.providers) == 0 {
+		return downloadResult{
+			OK:         false,
+			Error:      "no provider available for single strategy",
+			DurationMs: time.Since(startTime).Milliseconds(),
+		}
+	}
+	res := m.providers[0].Download(ctx, req)
+	res.DurationMs = time.Since(startTime).Milliseconds()
+	return res
+}
+
+func (m *ProviderManager) runFallback(ctx context.Context, req downloadRequest) downloadResult {
+	startTime := time.Now()
+	var attempts []providerAttempt
+
+	for _, p := range m.providers {
+		if ctx.Err() != nil {
+			break
+		}
+		res := p.Download(ctx, req)
+		attempts = append(attempts, res.Attempts...)
+
+		if res.OK && isValidDownloadedFile(res.FilePath) {
+			res.Attempts = attempts
+			res.DurationMs = time.Since(startTime).Milliseconds()
+			return res
+		}
+	}
+
+	return downloadResult{
+		OK:         false,
+		Error:      "all providers failed in fallback mode",
+		Attempts:   attempts,
+		DurationMs: time.Since(startTime).Milliseconds(),
+	}
+}
+
+func (m *ProviderManager) runRace(ctx context.Context, req downloadRequest) downloadResult {
+	startTime := time.Now()
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resultChan := make(chan downloadResult, len(m.providers))
+	var wg sync.WaitGroup
+
+	for _, p := range m.providers {
+		wg.Add(1)
+		go func(prov DownloadProvider) {
+			defer wg.Done()
+
+			provStart := time.Now()
+			provChan := make(chan downloadResult, 1)
+
+			go func() {
+				provChan <- prov.Download(raceCtx, req)
+			}()
+
+			select {
+			case res := <-provChan:
+				resultChan <- res
+			case <-raceCtx.Done():
+				durationMs := time.Since(provStart).Milliseconds()
+				resultChan <- downloadResult{
+					OK:           false,
+					ProviderName: prov.Name(),
+					DurationMs:   durationMs,
+					Error:        "cancelled by other race winner or timeout",
+					Attempts: []providerAttempt{
+						{
+							Provider:   prov.Name(),
+							OK:         false,
+							DurationMs: durationMs,
+							Error:      "cancelled by other race winner or timeout",
+						},
+					},
+				}
+			}
+		}(p)
+	}
+
+	var attempts []providerAttempt
+	var finalRes downloadResult
+	var won bool
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	for res := range resultChan {
+		attempts = append(attempts, res.Attempts...)
+		if res.OK && isValidDownloadedFile(res.FilePath) && !won {
+			won = true
+			finalRes = res
+			cancel()
+		}
+	}
+
+	durationMs := time.Since(startTime).Milliseconds()
+	if won {
+		finalRes.Attempts = attempts
+		finalRes.DurationMs = durationMs
+		return finalRes
+	}
+
+	return downloadResult{
+		OK:         false,
+		Error:      "all providers failed in race mode",
+		Attempts:   attempts,
+		DurationMs: durationMs,
+	}
+}
+
+func (s *apiServer) getProvidersForRequest(requestedProvider string, requestedStrategy string, engine string) ([]DownloadProvider, string, error) {
+	strategy := strings.ToLower(strings.TrimSpace(requestedStrategy))
+	provName := strings.ToLower(strings.TrimSpace(requestedProvider))
+
+	if provName != "" && strategy == "" {
+		strategy = "single"
+	}
+	if strategy == "" {
+		strategy = strings.ToLower(downloadStrategy)
+	}
+	if strategy != "race" && strategy != "fallback" && strategy != "single" {
+		strategy = "race"
+	}
+
+	if strategy == "single" && provName == "" {
+		if len(defaultDownloadProviderOrder) > 0 {
+			provName = defaultDownloadProviderOrder[0]
+		} else {
+			provName = "go"
+		}
+	}
+
+	var list []DownloadProvider
+
+	createProvider := func(name string) DownloadProvider {
+		if name == "go" {
+			return &GoProvider{server: s, engine: engine}
+		}
+		if name == "python" && pythonProviderEnabled {
+			return &PythonProvider{
+				pythonVenvDir: pythonVenvDir,
+				wrapperPath:   pythonWrapperPath,
+			}
+		}
+		return nil
+	}
+
+	if strategy == "single" {
+		p := createProvider(provName)
+		if p == nil {
+			return nil, "", fmt.Errorf("requested provider %q is not enabled or supported", provName)
+		}
+		list = append(list, p)
+	} else {
+		for _, name := range defaultDownloadProviderOrder {
+			p := createProvider(name)
+			if p != nil {
+				list = append(list, p)
+			}
+		}
+		if len(list) == 0 {
+			list = append(list, &GoProvider{server: s, engine: engine})
+		}
+	}
+
+	return list, strategy, nil
+}
+
+// Unix process management helpers (compatible with macOS and Linux)
+func setProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+func isValidDownloadedFile(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+	stat, err := os.Stat(filePath)
+	if err != nil {
+		return false
+	}
+	if stat.Size() < 1000 {
+		return false
+	}
+	ffprobePath, err := backend.GetFFprobePath()
+	if err == nil && ffprobePath != "" {
+		probeCmd := exec.Command(ffprobePath, "-v", "error", "-show_format", "-show_streams", filePath)
+		if err := probeCmd.Run(); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func envBoolDefaultFalse(name string) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if raw == "" {
+		return false
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// 4. Diagnostics & Warmup handlers
+
+func (s *apiServer) handleDiagnosticsProviders(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{OK: false, Error: "method not allowed"})
+		return
+	}
+
+	type checkResult struct {
+		OK      bool   `json:"ok"`
+		Details string `json:"details,omitempty"`
+	}
+
+	results := make(map[string]any)
+
+	results["providers_enabled"] = splitCSVEnv("DOWNLOAD_PROVIDERS", []string{"go", "python"})
+	results["default_strategy"] = envStringDefault("DOWNLOAD_STRATEGY", "race")
+	results["provider_order"] = splitCSVEnv("DEFAULT_DOWNLOAD_PROVIDER_ORDER", []string{"go", "python"})
+
+	ffmpegPath, err := backend.GetFFmpegPath()
+	if err != nil {
+		results["ffmpeg"] = checkResult{OK: false, Details: err.Error()}
+	} else {
+		cmd := exec.Command(ffmpegPath, "-version")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			results["ffmpeg"] = checkResult{OK: false, Details: fmt.Sprintf("failed to run: %v", err)}
+		} else {
+			firstLine := strings.Split(out.String(), "\n")[0]
+			results["ffmpeg"] = checkResult{OK: true, Details: fmt.Sprintf("path: %s, version: %s", ffmpegPath, firstLine)}
+		}
+	}
+
+	ffprobePath, err := backend.GetFFprobePath()
+	if err != nil {
+		results["ffprobe"] = checkResult{OK: false, Details: err.Error()}
+	} else {
+		cmd := exec.Command(ffprobePath, "-version")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			results["ffprobe"] = checkResult{OK: false, Details: fmt.Sprintf("failed to run: %v", err)}
+		} else {
+			firstLine := strings.Split(out.String(), "\n")[0]
+			results["ffprobe"] = checkResult{OK: true, Details: fmt.Sprintf("path: %s, version: %s", ffprobePath, firstLine)}
+		}
+	}
+
+	results["python_enabled"] = pythonProviderEnabled
+	results["python_venv_dir"] = pythonVenvDir
+	results["python_wrapper_path"] = pythonWrapperPath
+
+	if _, err := os.Stat(pythonWrapperPath); err == nil {
+		results["python_wrapper_exists"] = true
+	} else {
+		results["python_wrapper_exists"] = false
+	}
+
+	pythonBin := filepath.Join(pythonVenvDir, "bin", "python3")
+	if _, err := os.Stat(pythonBin); err == nil {
+		results["python_venv_exists"] = true
+		cmd := exec.Command(pythonBin, "--version")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			results["python_version"] = strings.TrimSpace(out.String())
+		}
+	} else {
+		results["python_venv_exists"] = false
+	}
+
+	refBytes, err := os.ReadFile("/app/.python-spotiflac-ref")
+	if err != nil {
+		refBytes, err = os.ReadFile(".python-spotiflac-ref")
+	}
+	if err == nil {
+		results["python_ref"] = strings.TrimSpace(string(refBytes))
+	} else {
+		results["python_ref"] = "unknown"
+	}
+
+	results["go_provider_available"] = true
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"results": results,
+	})
+}
+
+func (s *apiServer) handleWarmup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{OK: false, Error: "method not allowed"})
+		return
+	}
+
+	timeoutSecs := envIntDefault("WARMUP_TIMEOUT_SECONDS", 60)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	type warmupStatus struct {
+		OK      bool   `json:"ok"`
+		Details string `json:"details,omitempty"`
+	}
+
+	results := make(map[string]warmupStatus)
+	allOK := true
+
+	if err := s.ensureFFmpegBinaries(); err != nil {
+		results["ffmpeg_install"] = warmupStatus{OK: false, Details: err.Error()}
+		allOK = false
+	} else {
+		results["ffmpeg_install"] = warmupStatus{OK: true, Details: "ready"}
+	}
+
+	results["go_provider"] = warmupStatus{OK: true, Details: "available"}
+
+	if pythonProviderEnabled {
+		pythonBin := filepath.Join(pythonVenvDir, "bin", "python3")
+		if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
+			pythonBin = "python3"
+		}
+		cmd := exec.CommandContext(ctx, pythonBin, "-c", "import sys; sys.path.insert(0, '/opt/python-spotiflac-src'); sys.path.insert(0, '/opt/python-spotiflac-src/backend'); from SpotiFLAC import SpotiFLAC; print('OK')")
+		setProcessGroup(cmd)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+		if ctx.Err() != nil {
+			killProcessGroup(cmd)
+		}
+		if err != nil {
+			results["python_provider"] = warmupStatus{OK: false, Details: fmt.Sprintf("import test failed: %v", err)}
+			allOK = false
+		} else {
+			results["python_provider"] = warmupStatus{OK: true, Details: strings.TrimSpace(out.String())}
+		}
+	} else {
+		results["python_provider"] = warmupStatus{OK: true, Details: "disabled"}
+	}
+
+	tempDir, err := os.MkdirTemp("", "spotiflac-warmup-")
+	if err != nil {
+		results["temp_dir"] = warmupStatus{OK: false, Details: err.Error()}
+		allOK = false
+	} else {
+		_ = os.RemoveAll(tempDir)
+		results["temp_dir"] = warmupStatus{OK: true, Details: "ready"}
+	}
+
+	fullDownload := envBoolDefaultFalse("FULL_WARMUP_DOWNLOAD")
+	if fullDownload {
+		testTrackURL := envStringDefault("TEST_TRACK_URL", "https://open.spotify.com/track/4PTG3Z6ehGkBF3sIqR13Cc")
+		log.Printf("[WARMUP] Starting full warmup download for URL: %s", testTrackURL)
+		req := downloadRequest{
+			SpotifyID:    "4PTG3Z6ehGkBF3sIqR13Cc",
+			SpotifyURL:   testTrackURL,
+			OutputDir:    filepath.Join(os.TempDir(), "spotiflac-warmup-dl"),
+			ServiceOrder: defaultServices,
+		}
+		p := &GoProvider{server: s, engine: "auto"}
+		res := p.Download(ctx, req)
+		if !res.OK {
+			results["full_download"] = warmupStatus{OK: false, Details: res.Error}
+			allOK = false
+		} else {
+			_ = os.Remove(res.FilePath)
+			results["full_download"] = warmupStatus{OK: true, Details: "download verified"}
+		}
+	}
+
+	log.Printf("[WARMUP] Completed. all_ok=%t, results=%v", allOK, results)
+
+	if !allOK {
+		log.Printf("Warning: Warmup failed or was incomplete: %v", results)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      allOK,
+		"results": results,
+	})
+}
+
 
 func (s *apiServer) handleDownloadByToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

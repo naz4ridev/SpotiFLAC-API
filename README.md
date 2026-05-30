@@ -9,31 +9,42 @@ REST API wrapper for [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC) focused 
 ## Features
 
 - Spotify track input (`https://open.spotify.com/track/...`, `spotify:track:...`, or raw track ID).
+- Multi-provider support (Go and Python implementations of SpotiFLAC).
+- Dynamic download strategies:
+  - `race`: runs providers in parallel and returns the fastest successful result.
+  - `fallback`: tries providers sequentially in order.
+  - `single`: runs only the specified provider.
 - Provider fallback chain (default order: `tidal -> qobuz -> amazon`).
-- Download engine selector: `auto`, `spotiflac`, or `monochrome`.
+- Download engine selector: `auto`, `spotiflac`, or `monochrome` (for the Go provider).
 - Temporary tokenized download URLs (`GET /v1/download/{token}`).
 - In-memory token store with TTL-based cleanup.
 - CORS enabled (`*`) for frontend/API integrations.
 - Automatic `ffmpeg/ffprobe` bootstrap on first download request (enabled by default).
+- Warmup endpoint (`POST /internal/warmup`) for preparing environments.
+- Diagnostics endpoint (`GET /diagnostics/providers`) for inspecting provider states.
 
 ## Architecture
 
 - `POST /v1/download-url`
-  - Validates input, provider order, and download engine.
-  - Ensures `ffmpeg/ffprobe` are available (auto-install if missing and enabled).
-  - Fetches Spotify metadata through SpotiFLAC backend.
-  - Uses `spotiflac`, `monochrome`, or `auto` fallback mode.
+  - Validates input, requested strategy, and download provider.
+  - Ensures `ffmpeg/ffprobe` are available.
+  - Resolves download via `ProviderManager` executing `race`, `fallback`, or `single` mode.
   - Stores file path + token + expiry in memory.
   - Returns a public download URL.
 - `GET /v1/download/{token}`
   - Validates token and expiry.
   - Streams file with `Content-Disposition: attachment`.
+- `GET /diagnostics/providers`
+  - Returns JSON with provider availability, paths, versions, and pinned commit info.
+- `POST /internal/warmup`
+  - Bootstraps binaries, verifies Python imports, and optionally does a full test download if `FULL_WARMUP_DOWNLOAD=true`.
 - Background cleaner
   - Removes expired tokens and associated temp files.
 
 ## Requirements
 
 - Go `1.25+`
+- Python `3.9+` (for Python provider)
 - Network access to upstream services used by SpotiFLAC.
 
 ## Run
@@ -58,26 +69,15 @@ BIND_ADDR=127.0.0.1 PORT=9000 BASE_URL=http://127.0.0.1:9000 go run .
 - `BASE_URL`: optional public base URL used when building `download_url`
 - `HTTP_CLIENT_TIMEOUT`: timeout for outbound HTTP calls from this API (default: `20s`)
 - `FFMPEG_AUTO_INSTALL`: auto-install `ffmpeg/ffprobe` when missing (default: `true`)
-  - accepted true values: `1`, `true`, `yes`, `on`
-  - accepted false values: `0`, `false`, `no`, `off`
-- `SPOTIFY_METADATA_TIMEOUT`: timeout for Spotify metadata resolution through SpotiFLAC (default: `45s`)
-- `MONOCHROME_DISCOVERY_URLS`: optional comma-separated list of discovery endpoints that return current Monochrome instances
-- `MONOCHROME_API_INSTANCES`: optional comma-separated override for Monochrome search/info instances
-- `MONOCHROME_STREAMING_INSTANCES`: optional comma-separated override for Monochrome streaming/manifest instances
-- `MONOCHROME_TIDAL_CLIENT_ID`: optional override for the browser client id used by Monochrome
-- `MONOCHROME_TIDAL_CLIENT_SECRET`: optional override for the browser client secret used by Monochrome
+- `DOWNLOAD_PROVIDERS`: enabled providers (default: `go,python`)
+- `DEFAULT_DOWNLOAD_PROVIDER_ORDER`: fallback/race priority order (default: `go,python`)
+- `DOWNLOAD_STRATEGY`: default strategy (default: `race`, valid: `race`, `fallback`, `single`)
+- `PYTHON_PROVIDER_ENABLED`: enable/disable python provider (default: `true`)
+- `PYTHON_PROVIDER_TIMEOUT_SECONDS`: subprocess timeout for Python provider (default: `180`)
+- `DOWNLOAD_GLOBAL_TIMEOUT_SECONDS`: global timeout for the API request (default: `240`)
+- `WARMUP_TIMEOUT_SECONDS`: timeout for the warmup endpoint (default: `60`)
 
-Defaults are kept in code. For day-to-day maintenance, the env surface is intentionally limited to what is most likely to change operationally: discovery URLs, Monochrome instance lists, and optional TIDAL browser credentials.
-
-Official TIDAL URLs and Monochrome endpoint paths are fixed in code on purpose. If those ever change, that is a code update rather than an `.env` update.
-
-There is also a ready-to-edit example file in `/Users/mariano.palomo/Dev/SpotiFLACAPI/.env.example`.
-
-Example:
-
-```bash
-BIND_ADDR=127.0.0.1 PORT=9000 DOWNLOAD_TTL=1h BASE_URL=http://127.0.0.1:9000 go run .
-```
+There is also a ready-to-edit example file in `.env.example`.
 
 ## FFmpeg behavior
 
@@ -95,6 +95,14 @@ In this API:
 
 Returns service status and current UTC timestamp.
 
+### `GET /diagnostics/providers`
+
+Returns the current providers state and system dependency statuses.
+
+### `POST /internal/warmup`
+
+Performs warmup preparation (ffmpeg check, python import check, and optional test track download).
+
 ### `POST /v1/download-url`
 
 Creates a downloadable resource from a Spotify track.
@@ -106,7 +114,9 @@ Request body:
   "spotify_url": "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp",
   "services": ["tidal", "qobuz", "amazon"],
   "ttl_seconds": 3600,
-  "engine": "auto"
+  "engine": "auto",
+  "provider": "python",
+  "strategy": "single"
 }
 ```
 
@@ -116,8 +126,12 @@ Notes:
 - `services` is optional; default order is `["tidal", "qobuz", "amazon"]`.
 - `ttl_seconds` is optional and capped server-side.
 - `engine` is optional; valid values are `auto`, `spotiflac`, and `monochrome`.
+- `provider` is optional; valid values are `go` and `python`.
+- `strategy` is optional; valid values are `race`, `fallback`, and `single`.
+  - If `provider` is defined and `strategy` is not, strategy defaults to `single`.
+  - If `strategy` is not defined, it defaults to the configured `DOWNLOAD_STRATEGY` (default: `race`).
 - `method` is accepted as an alias of `engine` in the JSON body.
-- `?engine=...` and `?method=...` in the request URL override the JSON body and are useful to force a mode during testing.
+- `?engine=...` and `?method=...` in the request URL override the JSON body.
 
 Success response:
 
@@ -130,9 +144,18 @@ Success response:
   "filename": "Track - Artist.flac",
   "download_url": "http://127.0.0.1:9000/v1/download/<token>",
   "expires_at": "2026-02-21T12:00:00Z",
+  "provider": "go",
+  "duration_ms": 4200,
   "attempts": [
     {
-      "service": "tidal"
+      "provider": "go",
+      "ok": true,
+      "duration_ms": 4180,
+      "service_attempts": [
+        {
+          "service": "tidal"
+        }
+      ]
     }
   ]
 }
