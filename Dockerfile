@@ -43,6 +43,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# Data dir for the SQLite C2 config store (mount a volume here in production).
+RUN mkdir -p /app/data
 COPY --from=builder /app/main .
 COPY scripts/ /app/scripts/
 COPY .python-spotiflac-ref /app/.python-spotiflac-ref
@@ -56,6 +58,7 @@ EXPOSE 8080
 ENV PORT=8080
 ENV BIND_ADDR=0.0.0.0
 ENV FFMPEG_AUTO_INSTALL=false
+ENV C2_DB_PATH=/app/data/c2.db
 ENV PYTHON_SPOTIFLAC_REPO=https://github.com/ShuShuzinhuu/SpotiFLAC-Module-Version.git
 ENV PYTHON_PROVIDER_ENABLED=true
 ENV PYTHON_PROVIDER_TIMEOUT_SECONDS=180

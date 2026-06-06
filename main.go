@@ -26,6 +26,9 @@ import (
 	"time"
 
 	"github.com/afkarxyz/SpotiFLAC/backend"
+
+	"spotiflacapi/internal/c2config"
+	"spotiflacapi/internal/status"
 )
 
 var (
@@ -37,6 +40,7 @@ var (
 		"tidal":  {},
 		"qobuz":  {},
 		"amazon": {},
+		"deezer": {}, // served by the spotbye engine (upstream skips it)
 	}
 	defaultServices = []string{"tidal", "qobuz", "amazon"}
 )
@@ -45,6 +49,7 @@ const (
 	downloadEngineAuto                              = "auto"
 	downloadEngineSpotiFLAC                         = "spotiflac"
 	downloadEngineMonochrome                        = "monochrome"
+	downloadEngineSpotbye                           = "spotbye"
 	defaultMonochromeTidalAuthURL                   = "https://auth.tidal.com/v1/oauth2/token"
 	defaultMonochromeTidalAPIBaseURL                = "https://api.tidal.com/v1"
 	defaultMonochromeTidalOpenAPIBaseURL            = "https://openapi.tidal.com/v2"
@@ -63,6 +68,7 @@ var validDownloadEngines = map[string]struct{}{
 	downloadEngineAuto:       {},
 	downloadEngineSpotiFLAC:  {},
 	downloadEngineMonochrome: {},
+	downloadEngineSpotbye:    {},
 }
 
 var defaultMonochromeAPIInstances = []string{
@@ -271,6 +277,9 @@ func (s *downloadStore) startCleanupLoop(ctx context.Context, interval time.Dura
 type apiServer struct {
 	store             *downloadStore
 	tasks             *taskStore
+	cfg               *c2config.Store
+	status            *status.Tracker
+	enforceActive     bool
 	baseURL           string
 	bindAddr          string
 	ttl               time.Duration
@@ -406,6 +415,40 @@ func main() {
 		ffmpegAutoInstall: ffmpegAutoInstall,
 	}
 
+	// C2 config store (SQLite). The DB is the source of truth for editable
+	// endpoints/settings; the environment only seeds an empty database so
+	// existing deployments keep working. See internal/c2config and /admin.
+	dbPath := envStringDefault("C2_DB_PATH", "c2.db")
+	if cfg, err := c2config.Open(dbPath); err != nil {
+		log.Printf("WARNING: C2 config store unavailable (%v); falling back to env-only config", err)
+	} else {
+		server.cfg = cfg
+		defer cfg.Close()
+		if seeded, err := cfg.SeedIfEmpty(buildSeedFromEnv()); err != nil {
+			log.Printf("WARNING: C2 seed failed: %v", err)
+		} else if seeded {
+			log.Printf("C2 config store seeded from environment at %s", dbPath)
+		}
+	}
+
+	// Status tracker: which methods are active (spotiflac-next gist + monochrome
+	// reachability + upstream). Used by /v1/status and download gating.
+	server.enforceActive = envBoolDefaultTrue("ENFORCE_ACTIVE_METHODS")
+	server.status = status.New(status.Config{
+		HTTPClient: server.httpClient,
+		TTL:        envDurationDefault("STATUS_CACHE_TTL", 60*time.Second),
+		StatusSourceURL: func() string {
+			if server.cfg != nil {
+				return server.cfg.Setting("status.source_url", "")
+			}
+			return envStringDefault("DOWNLOADER_STATUS_URL", "")
+		},
+		MonochromeInstances: func() []string {
+			list, _ := resolveInstanceList(server.cfg, "monochrome.api_instances", "MONOCHROME_API_INSTANCES", defaultMonochromeAPIInstances)
+			return list
+		},
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go server.store.startCleanupLoop(ctx, 1*time.Minute)
@@ -418,6 +461,9 @@ func main() {
 	mux.HandleFunc("/internal/warmup", server.handleWarmup)
 	mux.HandleFunc("/v1/download-url", server.handleCreateDownloadURL)
 	mux.HandleFunc("/v1/download/", server.handleDownloadByToken)
+	mux.HandleFunc("/v1/status", server.handleStatus)
+	mux.HandleFunc("/v1/lyrics", server.handleLyrics)
+	server.registerAdminRoutes(mux)
 	mux.HandleFunc("/", server.handleRoot)
 
 	listenAddr := net.JoinHostPort(bindAddr, port)
@@ -621,6 +667,8 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, createDownloadResponse{OK: false, Error: "no valid services in services[]"})
 		return
 	}
+	// Only attempt services the status payload reports as active (gating).
+	serviceOrder = s.filterActiveServices(r.Context(), serviceOrder)
 
 	if err := s.ensureFFmpegBinaries(); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, createDownloadResponse{OK: false, Error: err.Error()})
@@ -897,22 +945,36 @@ func (p *GoProvider) Download(ctx context.Context, req downloadRequest) download
 		downloadPath, attempts, err = p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
 		res.MethodUsed = downloadEngineMonochrome
 		serviceUsed = downloadEngineMonochrome
+	case downloadEngineSpotbye:
+		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotbye(ctx, req.Metadata, req.ServiceOrder, req.OutputDir)
+		res.MethodUsed = downloadEngineSpotbye
 	default:
-		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
-		res.MethodUsed = downloadEngineSpotiFLAC
-		if err != nil {
-			var monochromeAttempts []attempt
-			var monochromeErr error
-			var monochromePath string
-			monochromePath, monochromeAttempts, monochromeErr = p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
-			attempts = append(attempts, monochromeAttempts...)
-			if monochromeErr == nil {
-				downloadPath = monochromePath
-				serviceUsed = downloadEngineMonochrome
-				res.MethodUsed = downloadEngineMonochrome
-				err = nil
-			} else {
-				err = fmt.Errorf("spotiflac failed: %v; monochrome failed: %w", err, monochromeErr)
+		// auto: spotbye (Next C2) takes priority whenever its services are live
+		// per the status gating; then spotiflac (upstream), then monochrome. The
+		// result is the union of all three backends with spotbye preferred.
+		spotbyePath, spotbyeService, spotbyeAttempts, spotbyeErr := p.server.resolveWithSpotbye(ctx, req.Metadata, req.ServiceOrder, req.OutputDir)
+		attempts = append(attempts, spotbyeAttempts...)
+		if spotbyeErr == nil {
+			downloadPath = spotbyePath
+			serviceUsed = spotbyeService
+			res.MethodUsed = downloadEngineSpotbye
+		} else {
+			var spotiflacAttempts []attempt
+			downloadPath, serviceUsed, spotiflacAttempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
+			attempts = append(attempts, spotiflacAttempts...)
+			res.MethodUsed = downloadEngineSpotiFLAC
+
+			if err != nil {
+				monochromePath, monochromeAttempts, monochromeErr := p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
+				attempts = append(attempts, monochromeAttempts...)
+				if monochromeErr == nil {
+					downloadPath = monochromePath
+					serviceUsed = downloadEngineMonochrome
+					res.MethodUsed = downloadEngineMonochrome
+					err = nil
+				} else {
+					err = fmt.Errorf("spotbye failed: %v; spotiflac failed: %v; monochrome failed: %w", spotbyeErr, err, monochromeErr)
+				}
 			}
 		}
 	}
@@ -1843,7 +1905,7 @@ func (s *apiServer) resolveWithSpotiFLAC(spotifyID, spotifyURL string, meta trac
 func (s *apiServer) resolveWithMonochrome(ctx context.Context, meta trackMetadata, workDir string) (string, []attempt, error) {
 	attempts := make([]attempt, 0, 1)
 
-	client := newMonochromeClient(s.httpClient)
+	client := newMonochromeClient(s.httpClient, s.cfg)
 	track, err := client.searchTrack(ctx, meta)
 	if err != nil {
 		attempts = append(attempts, attempt{Service: downloadEngineMonochrome, Error: err.Error()})
@@ -1970,15 +2032,16 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 	}
 }
 
-func newMonochromeClient(httpClient *http.Client) *monochromeClient {
-	apiInstances, explicitAPIInstances := splitCSVEnvWithSource("MONOCHROME_API_INSTANCES", defaultMonochromeAPIInstances)
-	streamingInstances, explicitStreamingInstances := splitCSVEnvWithSource("MONOCHROME_STREAMING_INSTANCES", defaultMonochromeStreamingInstances)
+func newMonochromeClient(httpClient *http.Client, cfg *c2config.Store) *monochromeClient {
+	apiInstances, explicitAPIInstances := resolveInstanceList(cfg, "monochrome.api_instances", "MONOCHROME_API_INSTANCES", defaultMonochromeAPIInstances)
+	streamingInstances, explicitStreamingInstances := resolveInstanceList(cfg, "monochrome.streaming_instances", "MONOCHROME_STREAMING_INSTANCES", defaultMonochromeStreamingInstances)
+	discoveryURLs, _ := resolveInstanceList(cfg, "monochrome.discovery_urls", "MONOCHROME_DISCOVERY_URLS", defaultMonochromeDiscoveryURLs)
 
 	return &monochromeClient{
 		httpClient:                 httpClient,
 		apiInstances:               apiInstances,
 		streamingInstances:         streamingInstances,
-		discoveryURLs:              splitCSVEnv("MONOCHROME_DISCOVERY_URLS", defaultMonochromeDiscoveryURLs),
+		discoveryURLs:              discoveryURLs,
 		explicitAPIInstances:       explicitAPIInstances,
 		explicitStreamingInstances: explicitStreamingInstances,
 		discoveryPath:              defaultMonochromeDiscoveryPath,
@@ -1990,10 +2053,35 @@ func newMonochromeClient(httpClient *http.Client) *monochromeClient {
 		tidalOpenAPIBaseURL:        defaultMonochromeTidalOpenAPIBaseURL,
 		tidalTrackManifestPath:     defaultMonochromeTidalTrackManifestPathTemplate,
 		tidalPlaybackInfoPath:      defaultMonochromeTidalPlaybackInfoPathTemplate,
-		tidalClientID:              envStringDefault("MONOCHROME_TIDAL_CLIENT_ID", defaultMonochromeTidalClientID),
-		tidalClientSecret:          envStringDefault("MONOCHROME_TIDAL_CLIENT_SECRET", defaultMonochromeTidalClientSecret),
+		tidalClientID:              resolveSetting(cfg, "monochrome.tidal_client_id", "MONOCHROME_TIDAL_CLIENT_ID", defaultMonochromeTidalClientID),
+		tidalClientSecret:          resolveSetting(cfg, "monochrome.tidal_client_secret", "MONOCHROME_TIDAL_CLIENT_SECRET", defaultMonochromeTidalClientSecret),
 		tidalCountryCode:           defaultMonochromeTidalCountryCode,
 	}
+}
+
+// resolveInstanceList prefers the config store value for an instance list,
+// falling back to the environment and then compiled defaults. The list is
+// flagged "explicit" only when it diverges from the compiled default, so a
+// store seeded from defaults still allows discovery merging (preserving the
+// original env-based behavior).
+func resolveInstanceList(cfg *c2config.Store, settingKey, envName string, defaults []string) ([]string, bool) {
+	if cfg != nil {
+		if raw := cfg.Setting(settingKey, ""); raw != "" {
+			list := cfg.SettingCSV(settingKey, defaults)
+			return list, strings.Join(list, ",") != strings.Join(defaults, ",")
+		}
+	}
+	return splitCSVEnvWithSource(envName, defaults)
+}
+
+// resolveSetting prefers the config store, then the environment, then fallback.
+func resolveSetting(cfg *c2config.Store, settingKey, envName, fallback string) string {
+	if cfg != nil {
+		if v := cfg.Setting(settingKey, ""); v != "" {
+			return v
+		}
+	}
+	return envStringDefault(envName, fallback)
 }
 
 func (c *monochromeClient) searchTrack(ctx context.Context, meta trackMetadata) (monochromeTrack, error) {

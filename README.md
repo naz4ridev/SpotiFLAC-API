@@ -15,13 +15,15 @@ REST API wrapper for [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC) focused 
   - `fallback`: tries providers sequentially in order.
   - `single`: runs only the specified provider.
 - Provider fallback chain (default order: `tidal -> qobuz -> amazon`).
-- Download engine selector: `auto`, `spotiflac`, or `monochrome` (for the Go provider).
+- Download engine selector: `auto`, `spotiflac`, `monochrome`, or `spotbye` (for the Go provider).
+  - `auto` is a combo that prefers **spotbye** (SpotiFLAC-Next C2) whenever its services are live per the status gating, then falls back to `spotiflac` (upstream) and finally `monochrome`.
 - Temporary tokenized download URLs (`GET /v1/download/{token}`).
 - In-memory token store with TTL-based cleanup.
 - CORS enabled (`*`) for frontend/API integrations.
 - Automatic `ffmpeg/ffprobe` bootstrap on first download request (enabled by default).
 - Warmup endpoint (`POST /internal/warmup`) for preparing environments.
 - Diagnostics endpoint (`GET /diagnostics/providers`) for inspecting provider states.
+- SpotiFLAC-Next integration: `spotbye` C2 download engine, aggregated method status (`GET /v1/status`), lyrics (`GET /v1/lyrics`), a runtime-editable C2 config store (`/admin/`), and tooling to keep C2/monochrome endpoints fresh. See [docs/spotiflac-next-integration.md](docs/spotiflac-next-integration.md).
 
 ## Architecture
 
@@ -99,6 +101,29 @@ Returns service status and current UTC timestamp.
 
 Returns the current providers state and system dependency statuses.
 
+### `GET /v1/status`
+
+Aggregated availability of all worlds, mirroring SpotiFLAC-Next's "which methods
+are up" check: `spotiflac_next` (per service + variant from the status payload),
+`monochrome` (live instance reachability), and `spotiflac_upstream`. Downloads
+are gated on this (only active services are attempted; toggle with
+`ENFORCE_ACTIVE_METHODS`).
+
+### `GET /v1/lyrics`
+
+Fetches lyrics using the same multi-source chain as SpotiFLAC-Next (LRCLib →
+Musixmatch → Spotify color-lyrics). Query: `spotify_url` or `spotify_id`;
+optional `format=json|lrc|text`. Returns synced (LRC) and plain lyrics plus the
+source used.
+
+### `GET /admin/` · `GET|POST|PUT|DELETE /admin/c2` · `POST /admin/c2/import`
+
+Web UI and CRUD API for the C2 config store (SQLite). Lets you view and edit the
+spotbye/monochrome endpoints, lyric/metadata providers, and credentials at
+runtime, and bulk-import a `c2-manifest.json` produced by
+`scripts/extract-spotiflac-next.py`. **No authentication** — protected only by
+the loopback bind behind your reverse proxy.
+
 ### `POST /internal/warmup`
 
 Performs warmup preparation (ffmpeg check, python import check, and optional test track download).
@@ -125,7 +150,7 @@ Notes:
 - `spotify_url` is required.
 - `services` is optional; default order is `["tidal", "qobuz", "amazon"]`.
 - `ttl_seconds` is optional and capped server-side.
-- `engine` is optional; valid values are `auto`, `spotiflac`, and `monochrome`.
+- `engine` is optional; valid values are `auto`, `spotiflac`, `monochrome`, and `spotbye`.
 - `provider` is optional; valid values are `go` and `python`.
 - `strategy` is optional; valid values are `race`, `fallback`, and `single`.
   - If `provider` is defined and `strategy` is not, strategy defaults to `single`.
