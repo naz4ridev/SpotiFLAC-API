@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SpotiFLAC API · C2 admin</title>
+<style>
+  :root { color-scheme: light dark; --bd:#8884; --accent:#1db954; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; max-width: 1100px; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  .warn { background: #e7a23d22; border: 1px solid #e7a23d; padding: .5rem .75rem; border-radius: 6px; font-size: .85rem; margin: .75rem 0 1.25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { border: 1px solid var(--bd); padding: .35rem .5rem; text-align: left; vertical-align: middle; }
+  th { background: #8881; }
+  input, select, textarea { font: inherit; padding: .25rem .35rem; width: 100%; background: transparent; color: inherit; border: 1px solid var(--bd); border-radius: 4px; }
+  td input[type=checkbox] { width: auto; }
+  button { font: inherit; padding: .35rem .7rem; border-radius: 6px; border: 1px solid var(--bd); background: #8881; cursor: pointer; }
+  button.primary { background: var(--accent); color: #000; border-color: var(--accent); }
+  button.danger { color: #e55; }
+  .row-actions { white-space: nowrap; }
+  .toolbar { display: flex; gap: .5rem; align-items: center; margin: .5rem 0; flex-wrap: wrap; }
+  textarea { min-height: 6rem; font-family: ui-monospace, monospace; font-size: .8rem; }
+  #status { margin-left: auto; font-size: .8rem; opacity: .8; }
+  details { margin-top: 1rem; }
+  small.hint { opacity: .65; }
+</style>
+</head>
+<body>
+  <h1>SpotiFLAC API · C2 endpoint admin</h1>
+  <div class="warn">⚠ This panel has <strong>no authentication</strong>. It is protected only by the loopback bind (127.0.0.1) behind your reverse proxy. Do not expose it publicly.</div>
+
+  <div class="toolbar">
+    <button class="primary" id="add">+ Add endpoint</button>
+    <button id="reload">Reload from DB</button>
+    <span id="status"></span>
+  </div>
+
+  <h2>C2 endpoints</h2>
+  <table id="eps">
+    <thead><tr>
+      <th>service</th><th>role</th><th>variant</th><th>url</th>
+      <th>enabled</th><th>prio</th><th>notes</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Settings</h2>
+  <small class="hint">Lyric/metadata endpoints, status source, monochrome lists, credentials.</small>
+  <table id="settings">
+    <thead><tr><th>key</th><th>value</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="toolbar">
+    <input id="newKey" placeholder="new.setting.key" style="max-width:18rem" />
+    <input id="newVal" placeholder="value" />
+    <button id="addSetting">Set</button>
+  </div>
+
+  <details>
+    <summary>Import c2-manifest.json (bulk)</summary>
+    <p><small class="hint">Paste a manifest produced by <code>scripts/extract-spotiflac-next.py</code>. Existing rows are updated; nothing is deleted.</small></p>
+    <textarea id="manifest" placeholder='{"endpoints": {...}, "public_providers": {...}}'></textarea>
+    <div class="toolbar"><button id="import">Import manifest</button></div>
+  </details>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const api = (p, opts) => fetch(p, opts).then(async r => {
+  const t = await r.text();
+  let j; try { j = t ? JSON.parse(t) : {}; } catch { j = { error: t }; }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+});
+const setStatus = (m, err) => { const s = $('#status'); s.textContent = m; s.style.color = err ? '#e55' : ''; };
+
+let endpoints = [], settings = {};
+
+function epRow(e) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input data-f="service" value="${e.service||''}"></td>
+    <td><input data-f="role" value="${e.role||''}"></td>
+    <td><input data-f="variant" value="${e.variant||''}" style="max-width:5rem"></td>
+    <td><input data-f="url" value="${e.url||''}"></td>
+    <td style="text-align:center"><input type="checkbox" data-f="enabled" ${e.enabled?'checked':''}></td>
+    <td><input data-f="priority" type="number" value="${e.priority||0}" style="max-width:4rem"></td>
+    <td><input data-f="notes" value="${e.notes||''}"></td>
+    <td class="row-actions">
+      <button class="save">Save</button>
+      <button class="danger del">✕</button>
+    </td>`;
+  const read = () => {
+    const o = { id: e.id };
+    tr.querySelectorAll('[data-f]').forEach(el => {
+      const f = el.dataset.f;
+      o[f] = el.type === 'checkbox' ? el.checked : (el.type === 'number' ? +el.value : el.value);
+    });
+    return o;
+  };
+  tr.querySelector('.save').onclick = async () => {
+    const o = read();
+    try {
+      if (o.id) await api('/admin/c2/' + o.id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(o) });
+      else await api('/admin/c2', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(o) });
+      setStatus('Saved.'); load();
+    } catch (err) { setStatus(err.message, true); }
+  };
+  tr.querySelector('.del').onclick = async () => {
+    if (!e.id) { tr.remove(); return; }
+    if (!confirm(`Delete ${e.service}/${e.role}/${e.variant||'-'}?`)) return;
+    try { await api('/admin/c2/' + e.id, { method: 'DELETE' }); setStatus('Deleted.'); load(); }
+    catch (err) { setStatus(err.message, true); }
+  };
+  return tr;
+}
+
+function settingRow(k, v) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td><code>${k}</code></td><td><input value="${(v||'').replace(/"/g,'&quot;')}"></td>
+    <td class="row-actions"><button class="save">Save</button></td>`;
+  tr.querySelector('.save').onclick = async () => {
+    try { await api('/admin/settings/' + encodeURIComponent(k), { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ value: tr.querySelector('input').value }) });
+      setStatus('Saved.'); load(); } catch (err) { setStatus(err.message, true); }
+  };
+  return tr;
+}
+
+async function load() {
+  try {
+    const d = await api('/admin/c2');
+    endpoints = d.endpoints || []; settings = d.settings || {};
+    const tb = $('#eps tbody'); tb.innerHTML = '';
+    endpoints.forEach(e => tb.appendChild(epRow(e)));
+    const sb = $('#settings tbody'); sb.innerHTML = '';
+    Object.keys(settings).sort().forEach(k => sb.appendChild(settingRow(k, settings[k])));
+    setStatus(`${endpoints.length} endpoints · ${Object.keys(settings).length} settings`);
+  } catch (err) { setStatus(err.message, true); }
+}
+
+$('#add').onclick = () => $('#eps tbody').appendChild(epRow({ enabled: true }));
+$('#reload').onclick = async () => { try { await api('/admin/c2/reload', { method:'POST' }); setStatus('Reloaded.'); load(); } catch(e){ setStatus(e.message,true);} };
+$('#addSetting').onclick = async () => {
+  const k = $('#newKey').value.trim(); if (!k) return;
+  try { await api('/admin/settings/' + encodeURIComponent(k), { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ value: $('#newVal').value }) });
+    $('#newKey').value=''; $('#newVal').value=''; setStatus('Saved.'); load(); } catch(e){ setStatus(e.message,true);} };
+$('#import').onclick = async () => {
+  try { const r = await api('/admin/c2/import', { method:'POST', headers:{'Content-Type':'application/json'}, body: $('#manifest').value });
+    setStatus(`Imported ${r.endpoints} endpoints, ${r.settings} settings.`); load(); } catch(e){ setStatus(e.message,true);} };
+
+load();
+</script>
+</body>
+</html>

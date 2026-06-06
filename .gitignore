@@ -4,4 +4,10 @@ spotiflacapi
 .gomodcache/
 .env
 scratch/
+# Local C2 config store (SQLite) + its WAL/SHM sidecars
+c2.db
+c2.db-wal
+c2.db-shm
+# Python extractor bytecode cache
+scripts/__pycache__/
 

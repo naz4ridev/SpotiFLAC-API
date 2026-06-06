@@ -19,6 +19,65 @@ To keep the production environment clean, the updater lives in a dedicated branc
 
 ---
 
+## C2 config store persistence (SQLite)
+
+The API now keeps its editable C2 endpoints and settings in a SQLite database
+(`C2_DB_PATH`, default `/app/data/c2.db`) instead of hard-coded `.env` values.
+This database is the source of truth and must **survive redeploys**:
+
+- `docker-compose.yml` mounts the named volume `c2-data` at `/app/data`. The
+  branch-based updater only bumps `go.mod`/`go.sum` and redeploys, so the volume
+  (and therefore all operator C2 edits) persists across updates automatically.
+- On first boot of an empty database the store seeds itself from the existing
+  `.env` (Monochrome lists, credentials, status source), so nothing is lost in
+  the migration.
+- View/edit endpoints live at `/admin/` (web) or via the `/admin/c2` API.
+
+### Refreshing C2 when a new SpotiFLAC-Next is released
+
+The C2 addresses change between SpotiFLAC-Next builds. Two ways to refresh them
+without decompiling:
+
+**Manual (you already have the .app/binary):**
+
+```bash
+scripts/update-c2-from-binary.sh /path/to/SpotiFLAC-Next.app --apply --api "$BASE_URL"
+```
+
+**Automated (fetch the latest build itself):** `check-c2-updates.sh` reads the
+supporter gist, resolves its Google Drive folder, downloads the latest macOS
+`.dmg`, extracts the `.app`, runs the extractor, diffs against the committed
+manifest, and (with `--apply`) imports the changes into the running API. It
+records the last seen version in `STATE_DIR` so it only acts on real changes —
+ideal to run from the same systemd timer as `update.sh`.
+
+```bash
+# Requires python3 + 7z (Linux) or hdiutil (macOS); gdown is auto-installed in a venv.
+API_BASE_URL="$BASE_URL" updater/check-c2-updates.sh --apply
+```
+
+Both paths ultimately `POST` a `c2-manifest.json` to `/admin/c2/import`, updating
+the running API in place (existing rows are updated; nothing is deleted).
+
+### Refreshing Monochrome instances
+
+Monochrome instances are community-hosted and rotate independently of
+SpotiFLAC-Next releases, so they are no longer hard-coded in `.env`. The canonical
+list lives in the project's
+[INSTANCES.md](https://github.com/monochrome-music/monochrome/blob/main/INSTANCES.md).
+`check-c2-updates.sh` refreshes them on every run (independent of the version
+check); you can also run it standalone:
+
+```bash
+scripts/fetch-monochrome-instances.py --apply --api "$BASE_URL"   # writes monochrome.* settings
+scripts/fetch-monochrome-instances.py --json                       # dry-run, just print parsed lists
+```
+
+The API still probes reachability of these via `GET /v1/status` and discovers
+more at runtime from the uptime tracker.
+
+---
+
 ## Initial Setup on GitHub
 
 Follow these steps to create the `spotiflac-updater` branch using this directory's files:

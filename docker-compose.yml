@@ -15,9 +15,18 @@ services:
     environment:
       - BIND_ADDR=0.0.0.0
       - PORT=${CONTAINER_PORT:-8080}
+      # Persist the C2 config store (SQLite) on the named volume below so
+      # operator edits survive image rebuilds / redeploys.
+      - C2_DB_PATH=/app/data/c2.db
+    volumes:
+      - c2-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${CONTAINER_PORT:-8080}/health"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  # Holds the SQLite C2 config store; keep it across deploys to retain edits.
+  c2-data:

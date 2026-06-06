@@ -1,0 +1,147 @@
+{
+  "meta": {
+    "extracted_at": "2026-06-06T21:30:00.836825+00:00",
+    "binary_path": "/Applications/SpotiFLAC-Next.app/Contents/MacOS/SpotiFLAC-Next",
+    "binary_sha256": "15ea4a66ac30b0f903216a0557b44af6899fe5e0df2070b842817148e5ce115c",
+    "binary_size": 42554112,
+    "app_version": "1.3.1",
+    "extractor_version": 1
+  },
+  "endpoints": {
+    "_status.status": {
+      "service": "_status",
+      "role": "status",
+      "host": "status.spotbye.qzz.io",
+      "example_url": "https://status.spotbye.qzz.io/status.json"
+    },
+    "amazon.download": {
+      "service": "amazon",
+      "role": "download",
+      "host": "amz.spotbye.qzz.io",
+      "example_url": "https://amz.spotbye.qzz.io/"
+    },
+    "amazon.download_alt": {
+      "service": "amazon",
+      "role": "download_alt",
+      "host": "amznalt.spotbye.qzz.io",
+      "example_url": "https://amznalt.spotbye.qzz.io"
+    },
+    "apple.download": {
+      "service": "apple",
+      "role": "download",
+      "host": "am.spotbye.qzz.io",
+      "example_url": "https://am.spotbye.qzz.io"
+    },
+    "deezer.download": {
+      "service": "deezer",
+      "role": "download",
+      "host": "dzr.spotbye.qzz.io",
+      "example_url": "https://dzr.spotbye.qzz.io/api/track/%d?f=flac"
+    },
+    "jiosaavn.download": {
+      "service": "jiosaavn",
+      "role": "download",
+      "host": "jmdl.spotbye.qzz.io",
+      "example_url": "https://jmdl.spotbye.qzz.io/%s?format_id=%s"
+    },
+    "lyrics.aux": {
+      "service": "lyrics",
+      "role": "aux",
+      "host": "lcd.spotbye.qzz.io",
+      "example_url": "https://lcd.spotbye.qzz.io"
+    },
+    "musicbrainz.metadata": {
+      "service": "musicbrainz",
+      "role": "metadata",
+      "host": "mb.spotbye.qzz.io",
+      "example_url": "https://mb.spotbye.qzz.io/api/genre"
+    },
+    "qobuz.download": {
+      "service": "qobuz",
+      "role": "download",
+      "host": "qbz.spotbye.qzz.io",
+      "example_url": "https://qbz.spotbye.qzz.io/api/download-music?track_id"
+    },
+    "qobuz.download_alt": {
+      "service": "qobuz",
+      "role": "download_alt",
+      "host": "qbzalt.spotbye.qzz.io",
+      "example_url": "https://qbzalt.spotbye.qzz.io/%s?quality=%s"
+    },
+    "tidal.download": {
+      "service": "tidal",
+      "role": "download",
+      "host": "tdl.spotbye.qzz.io",
+      "example_url": "https://tdl.spotbye.qzz.io/artists/"
+    },
+    "tidal.download_alt": {
+      "service": "tidal",
+      "role": "download_alt",
+      "host": "tdlalt.spotbye.qzz.io",
+      "example_url": "https://tdlalt.spotbye.qzz.io"
+    },
+    "tidal.download_fallback": {
+      "service": "tidal",
+      "role": "download_fallback",
+      "host": "flacdownloader.com",
+      "example_url": "https://flacdownloader.com/flac/download-token"
+    },
+    "tidal.keys": {
+      "service": "tidal",
+      "role": "keys",
+      "host": "tidal.anandserver.cfd",
+      "example_url": "https://tidal.anandserver.cfd"
+    }
+  },
+  "public_providers": {
+    "lyrics.lrclib_get": "https://lrclib.net/api/get?artist_name=%s&track_name=%s",
+    "lyrics.lrclib_search": "https://lrclib.net/api/search?q=%s",
+    "lyrics.musixmatch_token": "https://apic.musixmatch.com/ws/1.1/token.get",
+    "lyrics.musixmatch_ws": "https://apic.musixmatch.com/ws/1.1/token.get",
+    "lyrics.spotify_color": "https://spclient.wg.spotify.com/color-lyrics/v2/track/%s?format=json&market=from_token",
+    "metadata.musicbrainz_genre": "https://mb.spotbye.qzz.io/api/genre",
+    "metadata.spotify_token": "https://open.spotify.com/api/token"
+  },
+  "status_gists": [
+    "gist.githubusercontent.com/afkarxyz/26a921ae8f7f16fa121f0b8d9e89b0f0/raw",
+    "gist.githubusercontent.com/afkarxyz/4f27b9e1d7eceb929039bb130d6552a5/raw",
+    "gist.githubusercontent.com/afkarxyz/527da6603b392dd5feff853863c3aff7/raw",
+    "gist.githubusercontent.com/afkarxyz/6e57cd362cbd67f889e3a91a76254a5e/raw"
+  ],
+  "constants": {
+    "user_agent": [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    ]
+  },
+  "all_c2_hosts": [
+    "am.spotbye.qzz.io",
+    "amz.spotbye.qzz.io",
+    "amz.squid.wtf",
+    "amznalt.spotbye.qzz.io",
+    "com.spotbye.qzz.io",
+    "commb.spotbye.qzz.io",
+    "deezer.anandserver.cfd",
+    "dzr.spotbye.qzz.io",
+    "emptytdl.spotbye.qzz.io",
+    "existjmdl.spotbye.qzz.io",
+    "flacdownloader.com",
+    "jmdl.spotbye.qzz.io",
+    "lcd.spotbye.qzz.io",
+    "mb.spotbye.qzz.io",
+    "nameam.spotbye.qzz.io",
+    "playlistsqbzbckp.spotbye.qzz.io",
+    "qbz.spotbye.qzz.io",
+    "qbzalt.spotbye.qzz.io",
+    "qbzbckp.spotbye.qzz.io",
+    "qbzmt.spotbye.qzz.io",
+    "spotbye.qzz.io",
+    "status.spotbye.qzz.io",
+    "tdl.spotbye.qzz.io",
+    "tdlalt.spotbye.qzz.io",
+    "tidal.anandserver.cfd",
+    "vtdlalt.spotbye.qzz.io"
+  ]
+}
