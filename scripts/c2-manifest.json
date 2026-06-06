@@ -1,6 +1,6 @@
 {
   "meta": {
-    "extracted_at": "2026-06-06T21:30:00.836825+00:00",
+    "extracted_at": "2026-06-06T21:48:43.466661+00:00",
     "binary_path": "/Applications/SpotiFLAC-Next.app/Contents/MacOS/SpotiFLAC-Next",
     "binary_sha256": "15ea4a66ac30b0f903216a0557b44af6899fe5e0df2070b842817148e5ce115c",
     "binary_size": 42554112,
@@ -67,6 +67,18 @@
       "role": "download_alt",
       "host": "qbzalt.spotbye.qzz.io",
       "example_url": "https://qbzalt.spotbye.qzz.io/%s?quality=%s"
+    },
+    "qobuz.download_backup": {
+      "service": "qobuz",
+      "role": "download_backup",
+      "host": "qbzbckp.spotbye.qzz.io",
+      "example_url": "https://qbzbckp.spotbye.qzz.io"
+    },
+    "qobuz.search": {
+      "service": "qobuz",
+      "role": "search",
+      "host": "qbzmt.spotbye.qzz.io",
+      "example_url": "https://qbzmt.spotbye.qzz.io"
     },
     "tidal.download": {
       "service": "tidal",

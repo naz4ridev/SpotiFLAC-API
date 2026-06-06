@@ -9,40 +9,38 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/afkarxyz/SpotiFLAC/backend"
 )
 
 // spotbye.go implements the "spotbye" download engine: the private SpotiFLAC-Next
-// C2 endpoints (*.spotbye.qzz.io, flacdownloader.com, ...). Unlike the upstream
-// SpotiFLAC backend (which targets the older afkarxyz.qzz.io hosts), these
-// addresses and their API shapes change between Next releases, so every endpoint
-// URL is read from the C2 config store (seeded/refreshed via the extraction
-// script) and the active variant is chosen using the status tracker.
+// C2 endpoints. Endpoint URLs and API keys are read from the C2 config store
+// (seeded from the extracted manifest, editable at /admin/), and the active
+// variant is chosen via the status tracker.
 //
-// Per-service track-ID resolution reuses odesli (backend.SongLinkClient), which
-// maps a Spotify track to its Tidal/Amazon URLs and ISRC; the Deezer id comes
-// from the public Deezer ISRC lookup.
+// Contracts (verified live, 2026-06):
+//   qobuz  : NO key needed.
+//            1) resolve qobuz id: GET qbzmt.spotbye.qzz.io/api/search?q={name artist}
+//               -> data.tracks.items[] each {id, isrc, title, hires, maximum_bit_depth}
+//            2) GET qbz.spotbye.qzz.io/api/download-music?track_id={id}
+//               -> {"success":true,"data":{"url":"<flac stream>"}}
+//   deezer : GET deezer.anandserver.cfd/api/track/{deezer_id}  (needs X-API-Key)
+//   tidal  : tidal.anandserver.cfd + flacdownloader.com        (needs X-API-Key)
+//   amazon : amz.squid.wtf                                      (needs X-API-Key)
 //
-// Endpoint contracts (reverse-engineered from SpotiFLAC-Next v1.3.x):
-//   deezer : dzr.spotbye.qzz.io/api/track/{deezer_id}?f=flac
-//   qobuz  : qbz.spotbye.qzz.io/api/download-music?track_id={qobuz_id}
-//            qbzalt.spotbye.qzz.io/{id}?quality={q}
-//   amazon : amz / amznalt .spotbye.qzz.io
-//   tidal  : tdl / tdlalt .spotbye.qzz.io  -> flacdownloader.com/flac/download[-token]
-//   apple  : am.spotbye.qzz.io
-// Responses are either a direct FLAC stream or JSON pointing at the media URL
-// (fields url / downloadUrl / streamUrl / stream / link / file / path, possibly
-// nested under "data"); spotbyeFetchMedia tolerates all of these.
+// The deezer/tidal/amazon keys are supporter-issued (self-serve generation was
+// retired; see antra.anandserver.cfd) and are NOT in the binary, so they live in
+// the config store (settings spotbye.<service>_api_key, or spotbye.api_key) and
+// are sent as the X-API-Key header. qobuz needs none.
 
 var (
 	tidalIDRe  = regexp.MustCompile(`(?:track/)(\d+)`)
 	amazonIDRe = regexp.MustCompile(`(?:tracks/)([A-Za-z0-9]+)`)
 )
 
-// resolveWithSpotbye tries each requested service via its spotbye C2 endpoint,
-// returning the path to the downloaded FLAC and the service used.
+// resolveWithSpotbye tries each requested service via its spotbye C2 endpoint.
 func (s *apiServer) resolveWithSpotbye(ctx context.Context, meta trackMetadata, serviceOrder []string, outputDir string) (string, string, []attempt, error) {
 	attempts := make([]attempt, 0, len(serviceOrder))
 	if s.cfg == nil {
@@ -77,127 +75,205 @@ func (s *apiServer) resolveWithSpotbye(ctx context.Context, meta trackMetadata, 
 	return "", "", attempts, fmt.Errorf("spotbye failed in all services: %s", strings.Join(serviceOrder, " -> "))
 }
 
-// spotbyeResolveMedia resolves an ffmpeg-ingestible media URL for a track on the
-// given service by resolving its id and calling the configured C2 endpoints in
-// order (primary -> alt -> fallback), returning the first that yields media.
+// spotbyeResolveMedia resolves an ffmpeg-ingestible media URL for a track.
 func (s *apiServer) spotbyeResolveMedia(ctx context.Context, service string, meta trackMetadata) (string, error) {
-	service = strings.ToLower(service)
+	switch strings.ToLower(service) {
+	case "qobuz":
+		return s.spotbyeQobuz(ctx, meta)
+	case "deezer":
+		return s.spotbyeByID(ctx, "deezer", meta)
+	case "tidal":
+		return s.spotbyeByID(ctx, "tidal", meta)
+	case "amazon":
+		return s.spotbyeByID(ctx, "amazon", meta)
+	case "apple":
+		return "", fmt.Errorf("spotbye apple: id resolution not implemented yet")
+	default:
+		return "", fmt.Errorf("unsupported spotbye service: %s", service)
+	}
+}
 
-	id, idErr := s.spotbyeServiceID(ctx, service, meta)
-	if idErr != nil {
-		return "", idErr
+// --- qobuz (verified, no key) -----------------------------------------------
+
+type qobuzTrack struct {
+	ID              int64  `json:"id"`
+	ISRC            string `json:"isrc"`
+	Title           string `json:"title"`
+	Hires           bool   `json:"hires"`
+	MaximumBitDepth int    `json:"maximum_bit_depth"`
+}
+
+// spotbyeQobuz resolves the best qobuz track id (matching ISRC, else highest
+// quality title match) and returns its FLAC stream URL.
+func (s *apiServer) spotbyeQobuz(ctx context.Context, meta trackMetadata) (string, error) {
+	searchTmpl := s.spotbyeSetting("spotbye.qobuz_search", "https://qbzmt.spotbye.qzz.io/api/search?q=%s")
+	query := strings.TrimSpace(meta.Name + " " + firstArtist(meta.Artists))
+	searchURL := strings.ReplaceAll(searchTmpl, "%s", url.QueryEscape(query))
+
+	var sr struct {
+		Data struct {
+			Tracks struct {
+				Items []qobuzTrack `json:"items"`
+			} `json:"tracks"`
+		} `json:"data"`
+	}
+	if err := s.spotbyeGetJSON(ctx, searchURL, "", &sr); err != nil {
+		return "", fmt.Errorf("qobuz search: %w", err)
+	}
+	items := sr.Data.Tracks.Items
+	if len(items) == 0 {
+		return "", fmt.Errorf("qobuz: no search results for %q", query)
 	}
 
+	id := pickQobuzTrack(items, meta.ISRC)
+	if id == 0 {
+		return "", fmt.Errorf("qobuz: no suitable track match")
+	}
+
+	dlBase := firstEnabledURL(s.cfg.EnabledURLs("qobuz", "download"),
+		"https://qbz.spotbye.qzz.io/api/download-music?track_id=")
+	dlURL := applyIDTemplate(dlBase, fmt.Sprintf("%d", id))
+
+	media, err := s.spotbyeFetchMedia(ctx, dlURL, "")
+	if err != nil {
+		return "", fmt.Errorf("qobuz download: %w", err)
+	}
+	return media, nil
+}
+
+// pickQobuzTrack chooses the best track: exact ISRC match first, otherwise the
+// highest-quality candidate (hires, then bit depth).
+func pickQobuzTrack(items []qobuzTrack, isrc string) int64 {
+	isrc = strings.ToUpper(strings.TrimSpace(isrc))
+	if isrc != "" {
+		for _, t := range items {
+			if strings.ToUpper(strings.TrimSpace(t.ISRC)) == isrc {
+				return t.ID
+			}
+		}
+	}
+	best := append([]qobuzTrack(nil), items...)
+	sort.SliceStable(best, func(i, j int) bool {
+		if best[i].Hires != best[j].Hires {
+			return best[i].Hires // hires first
+		}
+		return best[i].MaximumBitDepth > best[j].MaximumBitDepth
+	})
+	return best[0].ID
+}
+
+// --- id-template services (deezer / tidal / amazon, X-API-Key) ---------------
+
+// spotbyeByID resolves the service id, then tries each configured endpoint with
+// the service's API key until one yields a media URL.
+func (s *apiServer) spotbyeByID(ctx context.Context, service string, meta trackMetadata) (string, error) {
+	id, err := s.spotbyeServiceID(ctx, service, meta)
+	if err != nil {
+		return "", err
+	}
+	apiKey := s.spotbyeAPIKey(service)
 	endpoints := s.spotbyeEndpoints(service)
 	if len(endpoints) == 0 {
 		return "", fmt.Errorf("spotbye %s: no endpoint configured", service)
 	}
-
 	var lastErr error
 	for _, tmpl := range endpoints {
-		endpoint := applyIDTemplate(tmpl, id)
-		media, err := s.spotbyeFetchMedia(ctx, endpoint)
+		media, err := s.spotbyeFetchMedia(ctx, applyIDTemplate(tmpl, id), apiKey)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		return media, nil
 	}
+	if apiKey == "" {
+		return "", fmt.Errorf("spotbye %s: all endpoints failed (no X-API-Key set; deezer/tidal/amazon need a supporter key in setting spotbye.%s_api_key): %v", service, service, lastErr)
+	}
 	return "", fmt.Errorf("spotbye %s: all endpoints failed: %v", service, lastErr)
 }
 
-// spotbyeServiceID resolves the service-specific track identifier for a track.
+// spotbyeServiceID resolves the service-specific track id via odesli / Deezer.
 func (s *apiServer) spotbyeServiceID(ctx context.Context, service string, meta trackMetadata) (string, error) {
 	switch service {
 	case "deezer":
-		isrc := strings.TrimSpace(meta.ISRC)
-		if isrc == "" {
+		if strings.TrimSpace(meta.ISRC) == "" {
 			return "", fmt.Errorf("deezer: missing ISRC")
 		}
-		dz, err := s.resolveDeezerID(ctx, isrc)
+		dz, err := s.resolveDeezerID(ctx, meta.ISRC)
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("%d", dz), nil
-
 	case "tidal":
-		urls := s.resolveSongLinkURLs(meta.SpotifyID)
-		if urls != nil {
-			if m := tidalIDRe.FindStringSubmatch(urls.TidalURL); len(m) == 2 {
+		if u := s.resolveSongLinkURLs(meta.SpotifyID); u != nil {
+			if m := tidalIDRe.FindStringSubmatch(u.TidalURL); len(m) == 2 {
 				return m[1], nil
 			}
 		}
-		return "", fmt.Errorf("tidal: could not resolve tidal id via odesli")
-
+		return "", fmt.Errorf("tidal: could not resolve id via odesli")
 	case "amazon":
-		urls := s.resolveSongLinkURLs(meta.SpotifyID)
-		if urls != nil {
-			if m := amazonIDRe.FindStringSubmatch(urls.AmazonURL); len(m) == 2 {
+		if u := s.resolveSongLinkURLs(meta.SpotifyID); u != nil {
+			if m := amazonIDRe.FindStringSubmatch(u.AmazonURL); len(m) == 2 {
 				return m[1], nil
 			}
 		}
-		return "", fmt.Errorf("amazon: could not resolve amazon id via odesli")
-
-	case "qobuz", "apple":
-		// Qobuz needs its numeric id and Apple its track id; neither is provided
-		// by odesli. Qobuz is still covered by the upstream spotiflac engine in
-		// the auto chain. Tracked as remaining work.
-		return "", fmt.Errorf("spotbye %s: id resolution not implemented yet", service)
-
+		return "", fmt.Errorf("amazon: could not resolve id via odesli")
 	default:
-		return "", fmt.Errorf("unsupported spotbye service: %s", service)
+		return "", fmt.Errorf("unsupported service: %s", service)
 	}
 }
 
-// spotbyeEndpoints returns the ordered C2 endpoint templates for a service:
-// store-configured primary, then alt, then fallback, with sensible defaults.
+// spotbyeEndpoints returns ordered C2 endpoint templates for a service (store
+// first, then live-host-first defaults).
 func (s *apiServer) spotbyeEndpoints(service string) []string {
 	var out []string
-	add := func(urls []string) {
-		for _, u := range urls {
+	for _, role := range []string{"download", "download_alt", "download_fallback"} {
+		for _, u := range s.cfg.EnabledURLs(service, role) {
 			if strings.TrimSpace(u) != "" {
 				out = append(out, u)
 			}
 		}
 	}
-	add(s.cfg.EnabledURLs(service, "download"))
-	add(s.cfg.EnabledURLs(service, "download_alt"))
-	add(s.cfg.EnabledURLs(service, "download_fallback"))
-
 	if len(out) == 0 {
-		// Defaults if the store has no rows yet. Ordered live-host-first based on
-		// DNS reality (verified 2026-06): several spotbye.qzz.io download
-		// subdomains are NXDOMAIN in current builds, while the service backends
-		// actually resolve under anandserver.cfd / squid.wtf. qobuz is confirmed
-		// live (qbz.spotbye.qzz.io/api/download-music returns HTTP 400 on a bad
-		// id). The exact request paths for the anandserver/squid hosts are not
-		// statically recoverable and should be confirmed/overridden in prod via
-		// the /admin CRUD (where these hosts resolve); the spotbye templates are
-		// kept as fallbacks. The tolerant response parser handles either a direct
-		// stream or a JSON media-URL pointer regardless of host.
 		switch service {
-		case "qobuz":
-			out = []string{"https://qbz.spotbye.qzz.io/api/download-music?track_id=", "https://qbzalt.spotbye.qzz.io/%s?quality=27"}
 		case "deezer":
-			out = []string{"https://deezer.anandserver.cfd/%s", "https://dzr.spotbye.qzz.io/api/track/%d?f=flac"}
+			out = []string{"https://deezer.anandserver.cfd/api/track/%s"}
 		case "amazon":
-			out = []string{"https://amz.squid.wtf/%s", "https://amz.spotbye.qzz.io/api/track/%s"}
+			out = []string{"https://amz.squid.wtf/api/track/%s", "https://amz.spotbye.qzz.io/api/track/%s"}
 		case "tidal":
-			out = []string{"https://flacdownloader.com/flac/download?id=%s", "https://tdl.spotbye.qzz.io/api/track/%s"}
-		case "apple":
-			out = []string{"https://am.spotbye.qzz.io/api/track/%s"}
+			out = []string{"https://tidal.anandserver.cfd/api/track/%s", "https://flacdownloader.com/flac/download?id=%s"}
 		}
 	}
 	return out
 }
 
-// resolveSongLinkURLs fetches the odesli URL map for a Spotify track (best-effort).
+// --- helpers ----------------------------------------------------------------
+
+// spotbyeSetting reads a store setting with a fallback.
+func (s *apiServer) spotbyeSetting(key, fallback string) string {
+	if s.cfg != nil {
+		return s.cfg.Setting(key, fallback)
+	}
+	return fallback
+}
+
+// spotbyeAPIKey returns the supporter API key for a service: a per-service
+// setting, else a shared one.
+func (s *apiServer) spotbyeAPIKey(service string) string {
+	if s.cfg == nil {
+		return ""
+	}
+	if k := s.cfg.Setting("spotbye."+service+"_api_key", ""); k != "" {
+		return k
+	}
+	return s.cfg.Setting("spotbye.api_key", "")
+}
+
+// resolveSongLinkURLs fetches the odesli URL map for a Spotify track.
 func (s *apiServer) resolveSongLinkURLs(spotifyID string) *backend.SongLinkURLs {
 	if strings.TrimSpace(spotifyID) == "" {
 		return nil
 	}
-	client := backend.NewSongLinkClient()
-	urls, err := client.GetAllURLsFromSpotify(spotifyID, "US")
+	urls, err := backend.NewSongLinkClient().GetAllURLsFromSpotify(spotifyID, "US")
 	if err != nil {
 		return nil
 	}
@@ -207,20 +283,14 @@ func (s *apiServer) resolveSongLinkURLs(spotifyID string) *backend.SongLinkURLs 
 // resolveDeezerID looks up a Deezer numeric track id from an ISRC.
 func (s *apiServer) resolveDeezerID(ctx context.Context, isrc string) (int64, error) {
 	api := fmt.Sprintf("https://api.deezer.com/track/isrc:%s", url.PathEscape(isrc))
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, api, nil)
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("deezer isrc lookup: %w", err)
-	}
-	defer resp.Body.Close()
 	var payload struct {
 		ID    int64 `json:"id"`
 		Error *struct {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		return 0, fmt.Errorf("deezer isrc decode: %w", err)
+	if err := s.spotbyeGetJSON(ctx, api, "", &payload); err != nil {
+		return 0, fmt.Errorf("deezer isrc lookup: %w", err)
 	}
 	if payload.ID == 0 {
 		msg := "not found on deezer"
@@ -232,13 +302,32 @@ func (s *apiServer) resolveDeezerID(ctx context.Context, isrc string) (int64, er
 	return payload.ID, nil
 }
 
-// spotbyeFetchMedia calls a C2 endpoint and returns a media URL ffmpeg can read.
-// The C2 may stream the FLAC directly (the endpoint URL is returned as-is for
-// ffmpeg to fetch) or return JSON pointing at the media URL under one of several
-// known field names, possibly nested under "data".
-func (s *apiServer) spotbyeFetchMedia(ctx context.Context, endpoint string) (string, error) {
+// spotbyeGetJSON performs a GET (with optional X-API-Key) and decodes JSON.
+func (s *apiServer) spotbyeGetJSON(ctx context.Context, endpoint, apiKey string, out any) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	req.Header.Set("User-Agent", defaultMonochromeUserAgent)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("returned %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(out)
+}
+
+// spotbyeFetchMedia calls a C2 endpoint and returns a media URL ffmpeg can read:
+// either the endpoint itself (direct stream) or a JSON media-URL pointer.
+func (s *apiServer) spotbyeFetchMedia(ctx context.Context, endpoint, apiKey string) (string, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req.Header.Set("User-Agent", defaultMonochromeUserAgent)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("c2 request: %w", err)
@@ -250,15 +339,15 @@ func (s *apiServer) spotbyeFetchMedia(ctx context.Context, endpoint string) (str
 
 	ctype := resp.Header.Get("Content-Type")
 	if strings.Contains(ctype, "audio") || strings.Contains(ctype, "flac") || strings.Contains(ctype, "octet-stream") {
-		return endpoint, nil // direct stream; ffmpeg fetches it
+		return endpoint, nil
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", fmt.Errorf("c2 read: %w", err)
 	}
-	if url := extractMediaURL(body); url != "" {
-		return url, nil
+	if u := extractMediaURL(body); u != "" {
+		return u, nil
 	}
 	if len(body) > 4 && string(body[:4]) == "fLaC" {
 		return endpoint, nil
@@ -269,8 +358,8 @@ func (s *apiServer) spotbyeFetchMedia(ctx context.Context, endpoint string) (str
 // mediaURLFields are the JSON keys SpotiFLAC-Next uses for a downloadable URL.
 var mediaURLFields = []string{"url", "downloadUrl", "download_url", "streamUrl", "stream", "link", "file", "path"}
 
-// extractMediaURL pulls a media URL out of a C2 JSON response, checking the
-// known field names at the top level and nested under "data".
+// extractMediaURL pulls a media URL out of a C2 JSON response (top level or
+// nested under "data").
 func extractMediaURL(body []byte) string {
 	var top map[string]json.RawMessage
 	if json.Unmarshal(body, &top) != nil {
@@ -304,8 +393,7 @@ func pickURL(m map[string]json.RawMessage) string {
 	return ""
 }
 
-// applyIDTemplate substitutes the track id into an endpoint template. Supports
-// printf-style %d/%s and a trailing "track_id="/"id="/"/" suffix.
+// applyIDTemplate substitutes the track id into an endpoint template.
 func applyIDTemplate(endpoint, id string) string {
 	if strings.Contains(endpoint, "%d") || strings.Contains(endpoint, "%s") {
 		endpoint = strings.ReplaceAll(endpoint, "%d", id)

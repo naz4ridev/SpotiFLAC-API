@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -191,6 +192,12 @@ func buildSeedFromEnv() c2config.Seed {
 	// Status source: gist payload that lists which downloader methods are up.
 	put("status.source_url", envStringDefault("DOWNLOADER_STATUS_URL",
 		"https://gist.githubusercontent.com/afkarxyz/6e57cd362cbd67f889e3a91a76254a5e/raw"))
+
+	// Spotbye supporter API keys for the deezer/tidal/amazon C2 (qobuz needs none).
+	put("spotbye.deezer_api_key", strings.TrimSpace(os.Getenv("SPOTBYE_DEEZER_API_KEY")))
+	put("spotbye.tidal_api_key", strings.TrimSpace(os.Getenv("SPOTBYE_TIDAL_API_KEY")))
+	put("spotbye.amazon_api_key", strings.TrimSpace(os.Getenv("SPOTBYE_AMAZON_API_KEY")))
+	put("spotbye.qobuz_search", envStringDefault("SPOTBYE_QOBUZ_SEARCH", "https://qbzmt.spotbye.qzz.io/api/search?q=%s"))
 
 	return seed
 }

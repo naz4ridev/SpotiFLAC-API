@@ -83,23 +83,32 @@ SpotiFLAC-Next ships **multiple host families per service** (the `a..e/x`
 variants); only the currently-provisioned ones resolve, and the status payload
 says which are up. As of this writing (checked against 1.1.1.1 / 8.8.8.8):
 
-| Service | Live host | Notes |
-| --- | --- | --- |
-| qobuz | `qbz.spotbye.qzz.io/api/download-music?track_id=` | confirmed live (HTTP 400 on bad id) |
-| deezer | `deezer.anandserver.cfd` | `dzr.spotbye.qzz.io` is NXDOMAIN |
-| tidal | `tidal.anandserver.cfd` + `flacdownloader.com/flac/download[-token]` | `tdl*.spotbye.qzz.io` NXDOMAIN |
-| amazon | `amz.squid.wtf` | `amz*.spotbye.qzz.io` NXDOMAIN |
-| apple | `am.spotbye.qzz.io` | resolves |
-| musicbrainz | `mb.spotbye.qzz.io` | resolves |
+| Service | Status | Live host + contract | Key |
+| --- | --- | --- | --- |
+| **qobuz** | ✅ **working end-to-end** (verified download) | search `qbzmt.spotbye.qzz.io/api/search?q=` → match ISRC/hires → `qbz.spotbye.qzz.io/api/download-music?track_id={id}` → `{data:{url}}` | none |
+| deezer | host+path confirmed, needs key | `deezer.anandserver.cfd/api/track/{id}` (401 without key) | `X-API-Key` (supporter) |
+| tidal | needs key | `tidal.anandserver.cfd` + `flacdownloader.com/flac/download` | `X-API-Key` (supporter) |
+| amazon | needs key | `amz.squid.wtf` | `X-API-Key` (supporter) |
+| apple | id resolution TODO | `am.spotbye.qzz.io` | — |
 
-`spotbye.go` defaults are ordered **live-host-first** with the spotbye templates
-as fallbacks. The exact request **paths** for the `anandserver.cfd` / `squid.wtf`
-hosts are not recoverable from static strings (only the host is); confirm and
-set them in production via `/admin/` where those hosts resolve. qobuz is fully
-known (host + path + live).
+The `dzr/amz/tdl*/qbzalt/jmdl/lcd/status` `spotbye.qzz.io` subdomains are
+NXDOMAIN in current builds; the live backends moved to `anandserver.cfd` /
+`squid.wtf`. `spotbye.go` defaults are live-host-first.
+
+**Supporter API keys.** Self-serve key generation was retired
+(`tidal.anandserver.cfd/api/keys/generate` → HTTP 410, "Supporter keys are now
+issued directly by the developer; see antra.anandserver.cfd"). The deezer / tidal
+/ amazon C2 require an `X-API-Key`. These are **not** in the binary — set the key
+you receive as a supporter in the config store and the engine sends it:
+
+- per-service: `spotbye.deezer_api_key`, `spotbye.tidal_api_key`, `spotbye.amazon_api_key`
+- or a shared `spotbye.api_key`
+
+Set them via `/admin/` (web) or `PUT /admin/settings/spotbye.deezer_api_key`.
 
 ### Remaining work
 
-- qobuz/apple service-id resolution (odesli doesn't provide these); qobuz is
-  still covered by the upstream `spotiflac` engine inside `auto`.
-- Confirm deezer/tidal/amazon request paths against the live hosts in prod.
+- Supply the supporter `X-API-Key`(s) to enable deezer/tidal/amazon.
+- apple service-id resolution (odesli doesn't provide it).
+- Confirm the exact tidal/amazon request paths once a key is available (deezer
+  path `/api/track/{id}` is confirmed).

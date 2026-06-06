@@ -88,6 +88,8 @@ _SPOTBYE_MAP = {
     "tdlalt": ("tidal", "download_alt"),
     "qbz": ("qobuz", "download"),
     "qbzalt": ("qobuz", "download_alt"),
+    "qbzmt": ("qobuz", "search"),
+    "qbzbckp": ("qobuz", "download_backup"),
     "amz": ("amazon", "download"),
     "amznalt": ("amazon", "download_alt"),
     "dzr": ("deezer", "download"),
