@@ -19,6 +19,40 @@ To keep the production environment clean, the updater lives in a dedicated branc
 
 ---
 
+## C2 endpoint maintenance (SpotiFLAC-Next + Monochrome)
+
+The API keeps its C2 endpoints and settings in a SQLite store (`C2_DB_PATH`,
+default `/app/data/c2.db`, persisted on the `c2-data` Docker volume). The
+branch-based updater only bumps `go.mod`/`go.sum` and redeploys, so the volume —
+and all operator C2 edits — persists across updates automatically. View/edit at
+`/admin/` (web) or via the `/admin/c2` API.
+
+This branch also carries the C2 maintenance tooling (kept at the branch root so
+it is self-contained on the host):
+
+- **`check-c2-updates.sh`** — the orchestrator. On each run it refreshes the
+  Monochrome instance list from the canonical
+  [INSTANCES.md](https://github.com/monochrome-music/monochrome/blob/main/INSTANCES.md),
+  detects a new SpotiFLAC-Next release (gist → Google Drive → macOS `.dmg` →
+  `.app`), extracts its C2 (`extract-spotiflac-next.py`), diffs against the
+  committed `c2-manifest.json`, and with `--apply` imports the changes into the
+  running API (`POST /admin/c2/import`). It records the last seen version in
+  `STATE_DIR`. Requires `python3` + `7z`/`hdiutil`; `gdown` is auto-installed in
+  a venv.
+
+  ```bash
+  API_BASE_URL="$BASE_URL" ./check-c2-updates.sh --apply
+  ```
+
+- **`fetch-latest-next.py`** — gist → Drive → dmg → `.app` binary resolver.
+- **`fetch-monochrome-instances.py`** — parse INSTANCES.md → `monochrome.*` settings.
+- **`extract-spotiflac-next.py`** / **`update-c2-from-binary.sh`** — static C2
+  extraction + diff/import from a binary you already have.
+
+Run `check-c2-updates.sh` from the same systemd timer as `update.sh` (see below).
+
+---
+
 ## Initial Setup on GitHub
 
 Follow these steps to create the `spotiflac-updater` branch using this directory's files:

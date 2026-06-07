@@ -73,6 +73,18 @@ if ! echo "$HEALTH_RESP" | jq -e '.ok == true' >/dev/null; then
 fi
 log_info "Health check passed!"
 
+# 1b. Aggregated method status (informational; does not fail the smoke test).
+STATUS_URL="${BASE_URL}/v1/status"
+log_info "Checking aggregated status: GET ${STATUS_URL}"
+if STATUS_RESP=$(curl -fsSL --connect-timeout 10 -m 20 "$STATUS_URL" 2>/dev/null) && echo "$STATUS_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  MONO_UP=$(echo "$STATUS_RESP" | jq -r '.monochrome.instances_up // 0')
+  MONO_TOTAL=$(echo "$STATUS_RESP" | jq -r '.monochrome.instances_total // 0')
+  NEXT_ACTIVE=$(echo "$STATUS_RESP" | jq -r '[.spotiflac_next // {} | to_entries[] | select(.value.active)] | length')
+  log_info "Status OK: monochrome ${MONO_UP}/${MONO_TOTAL} up, spotiflac-next active services: ${NEXT_ACTIVE}"
+else
+  log_info "Status endpoint not available or returned no data (non-fatal)."
+fi
+
 # 2. Verify GET /diagnostics/providers (if exists)
 DIAGNOSTICS_URL="${BASE_URL}/diagnostics/providers"
 log_info "Testing diagnostics endpoint: GET ${DIAGNOSTICS_URL}"
