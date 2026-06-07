@@ -15,9 +15,8 @@ import (
 //go:embed webadmin/index.html
 var adminIndexHTML []byte
 
-// registerAdminRoutes wires the C2 CRUD API and web UI onto the mux. These
-// endpoints are intentionally unauthenticated and rely on the loopback bind
-// (see webadmin/index.html warning) per the deployment design.
+// registerAdminRoutes wires the C2 CRUD API and web UI onto the mux. Access
+// control is handled at the reverse proxy (e.g. HTTP basic auth).
 func (s *apiServer) registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin", s.handleAdminUI)
 	mux.HandleFunc("GET /admin/", s.handleAdminUI)

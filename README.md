@@ -121,8 +121,9 @@ source used.
 Web UI and CRUD API for the C2 config store (SQLite). Lets you view and edit the
 spotbye/monochrome endpoints, lyric/metadata providers, and credentials at
 runtime, and bulk-import a `c2-manifest.json` produced by
-`scripts/extract-spotiflac-next.py`. **No authentication** — protected only by
-the loopback bind behind your reverse proxy.
+`scripts/extract-spotiflac-next.py`. The admin panel resolves its API calls
+relative to its own path, so it works at `/admin/` or behind a reverse-proxy
+subpath. Protect it at your reverse proxy (e.g. HTTP basic auth).
 
 ### `POST /internal/warmup`
 

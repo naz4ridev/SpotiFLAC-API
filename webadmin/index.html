@@ -29,7 +29,6 @@
 </head>
 <body>
   <h1>SpotiFLAC API · C2 endpoint admin</h1>
-  <div class="warn">⚠ This panel has <strong>no authentication</strong>. It is protected only by the loopback bind (127.0.0.1) behind your reverse proxy. Do not expose it publicly.</div>
 
   <div class="toolbar">
     <button class="primary" id="add">+ Add endpoint</button>
@@ -67,7 +66,11 @@
 
 <script>
 const $ = (s) => document.querySelector(s);
-const api = (p, opts) => fetch(p, opts).then(async r => {
+// Resolve API calls relative to this page's path so the panel works whether it
+// is served at /admin/ or behind a reverse-proxy subpath (e.g.
+// /tools/spotiflacapi/admin/). Callers pass "/admin/..."; we re-anchor it.
+const ADMIN_BASE = location.pathname.replace(/\/+$/, '');
+const api = (p, opts) => fetch(ADMIN_BASE + p.replace(/^\/admin/, ''), opts).then(async r => {
   const t = await r.text();
   let j; try { j = t ? JSON.parse(t) : {}; } catch { j = { error: t }; }
   if (!r.ok) throw new Error(j.error || r.statusText);

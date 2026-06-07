@@ -29,7 +29,8 @@ C2 endpoints and tunable settings live in a SQLite DB (`C2_DB_PATH`, default
 `/app/data/c2.db`, persisted on the `c2-data` Docker volume). The DB is the
 source of truth; `.env` only seeds an empty DB on first boot. Manage it at:
 
-- `GET /admin/` — web UI (editable table). **No auth** — loopback-only.
+- `GET /admin/` — web UI (editable table). Protect it at your reverse proxy
+  (e.g. HTTP basic auth); the panel works at `/admin/` or behind a subpath.
 - `GET/POST /admin/c2`, `PUT/DELETE /admin/c2/{id}`, `PUT /admin/settings/{key}`
 - `POST /admin/c2/import` — bulk-import a `c2-manifest.json`
 - `POST /admin/c2/reload` — reload the cache

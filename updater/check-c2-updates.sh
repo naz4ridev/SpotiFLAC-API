@@ -20,9 +20,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The Go API scripts live in ../scripts when this runs from a full checkout, or
-# can be overridden via API_SCRIPTS_DIR for the dedicated updater branch layout.
-API_SCRIPTS_DIR="${API_SCRIPTS_DIR:-$SCRIPT_DIR/../scripts}"
+# Locate the Go API helper scripts. In a full master checkout they live in
+# ../scripts; on the flat spotiflac-updater branch they sit next to this file.
+# Override with API_SCRIPTS_DIR if needed.
+if [[ -z "${API_SCRIPTS_DIR:-}" ]]; then
+  if [[ -f "$SCRIPT_DIR/../scripts/extract-spotiflac-next.py" ]]; then
+    API_SCRIPTS_DIR="$SCRIPT_DIR/../scripts"
+  else
+    API_SCRIPTS_DIR="$SCRIPT_DIR"
+  fi
+fi
 EXTRACTOR="$API_SCRIPTS_DIR/extract-spotiflac-next.py"
 FETCHER="$API_SCRIPTS_DIR/fetch-latest-next.py"
 REF_MANIFEST="${REF_MANIFEST:-$API_SCRIPTS_DIR/c2-manifest.json}"
