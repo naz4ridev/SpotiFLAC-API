@@ -1708,10 +1708,49 @@ func (s *apiServer) handleDownloadByToken(w http.ResponseWriter, r *http.Request
 	}
 
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.Header().Set("Content-Disposition", contentDispositionAttachment(filename))
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeContent(w, r, filename, info.ModTime(), file)
+}
+
+// contentDispositionAttachment builds an RFC 6266 header that preserves
+// non-ASCII filenames (accents, etc.). HTTP headers are latin-1, so a bare
+// filename="<utf-8 bytes>" arrives mojibake'd in clients; we add the RFC 5987
+// filename*=UTF-8''… form plus an ASCII-only fallback for legacy clients.
+func contentDispositionAttachment(filename string) string {
+	ascii := asciiFallbackFilename(filename)
+	return fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", ascii, encodeRFC5987(filename))
+}
+
+func asciiFallbackFilename(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 0x20 && r < 0x7f && r != '"' && r != '\\' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if strings.Trim(out, " ._") == "" {
+		return "track" + filepath.Ext(s)
+	}
+	return out
+}
+
+func encodeRFC5987(s string) string {
+	const attrChars = "!#$&+-.^_`|~"
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			strings.IndexByte(attrChars, c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 type monochromeClient struct {
