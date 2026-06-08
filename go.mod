@@ -2,7 +2,11 @@ module spotiflacapi
 
 go 1.26
 
-require github.com/afkarxyz/SpotiFLAC v0.0.0-20260414003641-7346730be98c
+require (
+	github.com/afkarxyz/SpotiFLAC v0.0.0-20260414003641-7346730be98c
+	github.com/pquerna/otp v1.5.0
+	modernc.org/sqlite v1.52.0
+)
 
 require (
 	github.com/bogem/id3v2/v2 v2.1.4 // indirect
@@ -16,7 +20,6 @@ require (
 	github.com/leaanthony/u v1.1.1 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/pquerna/otp v1.5.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/wailsapp/wails/v2 v2.11.0 // indirect
@@ -27,5 +30,4 @@ require (
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.52.0 // indirect
 )

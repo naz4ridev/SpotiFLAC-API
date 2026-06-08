@@ -120,8 +120,8 @@ source used.
 
 Web UI and CRUD API for the C2 config store (SQLite). Lets you view and edit the
 spotbye/monochrome endpoints, lyric/metadata providers, and credentials at
-runtime, and bulk-import a `c2-manifest.json` produced by
-`scripts/extract-spotiflac-next.py`. The admin panel resolves its API calls
+runtime, and bulk-import a `c2-manifest.json` produced by the extractor on the
+`spotiflac-updater` branch. The admin panel resolves its API calls
 relative to its own path, so it works at `/admin/` or behind a reverse-proxy
 subpath. Protect it at your reverse proxy (e.g. HTTP basic auth).
 
@@ -280,7 +280,11 @@ To keep the production environment clean, the automated updater and monitoring s
 - **`main` Branch**: Contains only the core Go API codebase, `Dockerfile`, and `docker-compose.yml`. This is the branch that Coolify pulls, builds, and deploys to production.
 - **`spotiflac-updater` Branch**: Contains only the update script (`update.sh`), daily verification script (`daily-smoke.sh`), systemd timer configuration, and documentation. This is cloned on the host server at `/opt/spotiflac-updater` and schedules updates via local cron timers.
 
-For detailed instructions on how to create the updater branch, clone it onto your server, configure `.env`, and register automation timers, see the **[updater/README.md](file:///home/mariano_palomo/dev/personal/proyectos_personales/SpotiFLAC-API/updater/README.md)** file.
+The updater scripts (`update.sh`, `smoke-test.sh`, `check-c2-updates.sh`, the C2
+extraction/fetch tooling, systemd timers, and their docs) live entirely on the
+**`spotiflac-updater`** branch — they are not part of this deployable `master`
+branch. See that branch's `README.md` for setup, host install, `.env`, and timer
+registration.
 
 ---
 

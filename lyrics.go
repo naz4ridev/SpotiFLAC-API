@@ -3,34 +3,30 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/afkarxyz/SpotiFLAC/backend"
+	"spotiflacapi/internal/lyrics"
 )
 
-// lyricsResponse is the API shape for GET /v1/lyrics. It mirrors what
-// SpotiFLAC-Next produces: a source label, whether the lyrics are time-synced,
-// an LRC blob for synced lyrics, and the plain text fallback.
+// lyricsResponse is the API shape for GET /v1/lyrics.
 type lyricsResponse struct {
-	OK           bool                `json:"ok"`
-	SpotifyID    string              `json:"spotify_id"`
-	Track        string              `json:"track,omitempty"`
-	Artist       string              `json:"artist,omitempty"`
-	Source       string              `json:"source,omitempty"`
-	SyncType     string              `json:"sync_type,omitempty"`
-	Synced       bool                `json:"synced"`
-	Instrumental bool                `json:"instrumental"`
-	LRC          string              `json:"lrc,omitempty"`
-	PlainLyrics  string              `json:"plain_lyrics,omitempty"`
-	Lines        []backend.LyricsLine `json:"lines,omitempty"`
+	OK           bool   `json:"ok"`
+	SpotifyID    string `json:"spotify_id"`
+	Track        string `json:"track,omitempty"`
+	Artist       string `json:"artist,omitempty"`
+	Source       string `json:"source,omitempty"`
+	Synced       bool   `json:"synced"`
+	Instrumental bool   `json:"instrumental"`
+	LRC          string `json:"lrc,omitempty"`
+	PlainLyrics  string `json:"plain_lyrics,omitempty"`
 }
 
-// handleLyrics fetches lyrics for a Spotify track using the same multi-source
-// chain as SpotiFLAC-Next (LRCLib -> Musixmatch -> Spotify color-lyrics), which
-// is implemented by the upstream backend.LyricsClient.FetchLyricsAllSources.
-//
-// Query params: spotify_url or spotify_id (one required); format=json|lrc|text.
+// handleLyrics fetches lyrics using the same three providers as SpotiFLAC-Next:
+// Spotify color-lyrics (needs an sp_dc cookie), Musixmatch, and LRCLIB, synced
+// preferred. Query: spotify_url|spotify_id; format=json|lrc|text.
 func (s *apiServer) handleLyrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{OK: false, Error: "method not allowed"})
@@ -59,65 +55,88 @@ func (s *apiServer) handleLyrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Duration (seconds) helps LRCLib disambiguate; best-effort.
-	durationSec := 0
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+
+	durationSec := 0
 	if ms, derr := fetchExpectedDurationMs(ctx, spotifyURL); derr == nil && ms > 0 {
 		durationSec = int(ms / 1000)
 	}
 
-	client := backend.NewLyricsClient()
-	resp, source, err := client.FetchLyricsAllSources(meta.SpotifyID, meta.Name, meta.Artists, meta.AlbumName, durationSec)
-	if err != nil || resp == nil || resp.Error || len(resp.Lines) == 0 {
+	opts := lyrics.Options{
+		SpotifyID:   spotifyID,
+		Track:       meta.Name,
+		Artist:      meta.Artists,
+		Album:       meta.AlbumName,
+		ISRC:        meta.ISRC,
+		DurationSec: durationSec,
+		SpDc:        s.lyricsSetting("lyrics.spotify_sp_dc", "SPOTIFY_SP_DC"),
+		TotpSecret:  s.lyricsSetting("lyrics.spotify_totp_secret", "SPOTIFY_TOTP_SECRET"),
+		Order:       splitCSVSetting(s.lyricsSetting("lyrics.provider_order", "LYRICS_PROVIDER_ORDER"), nil),
+		HTTP:        s.httpClient,
+	}
+	if v := s.lyricsSetting("lyrics.spotify_totp_version", "SPOTIFY_TOTP_VERSION"); v != "" {
+		if n, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil {
+			opts.TotpVersion = n
+		}
+	}
+
+	res, err := lyrics.FetchAll(ctx, opts)
+	if err != nil || res == nil {
 		writeJSON(w, http.StatusNotFound, lyricsResponse{
-			OK: false, SpotifyID: spotifyID, Track: meta.Name, Artist: meta.Artists, Source: source,
+			OK: false, SpotifyID: spotifyID, Track: meta.Name, Artist: meta.Artists,
 		})
 		return
 	}
 
-	synced := strings.EqualFold(resp.SyncType, "LINE_SYNCED")
-	out := lyricsResponse{
-		OK:        true,
-		SpotifyID: spotifyID,
-		Track:     meta.Name,
-		Artist:    meta.Artists,
-		Source:    source,
-		SyncType:  resp.SyncType,
-		Synced:    synced,
-	}
-	plain := plainFromLines(resp.Lines)
-	out.PlainLyrics = plain
-	out.Instrumental = strings.TrimSpace(plain) == ""
-	if synced {
-		out.LRC = client.ConvertToLRC(resp, meta.Name, meta.Artists)
-	}
-
 	switch strings.ToLower(r.URL.Query().Get("format")) {
 	case "lrc":
-		body := out.LRC
+		body := res.LRC
 		if body == "" {
-			body = plain
+			body = res.Plain
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte(body))
 	case "text":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte(plain))
+		_, _ = w.Write([]byte(res.Plain))
 	default:
-		out.Lines = resp.Lines
-		writeJSON(w, http.StatusOK, out)
+		writeJSON(w, http.StatusOK, lyricsResponse{
+			OK:           true,
+			SpotifyID:    spotifyID,
+			Track:        meta.Name,
+			Artist:       meta.Artists,
+			Source:       res.Source,
+			Synced:       res.Synced,
+			Instrumental: res.Instrumental,
+			LRC:          res.LRC,
+			PlainLyrics:  res.Plain,
+		})
 	}
 }
 
-// plainFromLines joins synced/unsynced lyric lines into plain text.
-func plainFromLines(lines []backend.LyricsLine) string {
-	var b strings.Builder
-	for i, l := range lines {
-		if i > 0 {
-			b.WriteByte('\n')
+// lyricsSetting prefers the config store, then the environment.
+func (s *apiServer) lyricsSetting(settingKey, envName string) string {
+	if s.cfg != nil {
+		if v := s.cfg.Setting(settingKey, ""); v != "" {
+			return v
 		}
-		b.WriteString(l.Words)
 	}
-	return b.String()
+	return strings.TrimSpace(os.Getenv(envName))
+}
+
+func splitCSVSetting(raw string, fallback []string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return fallback
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }

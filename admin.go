@@ -198,5 +198,11 @@ func buildSeedFromEnv() c2config.Seed {
 	put("spotbye.amazon_api_key", strings.TrimSpace(os.Getenv("SPOTBYE_AMAZON_API_KEY")))
 	put("spotbye.qobuz_search", envStringDefault("SPOTBYE_QOBUZ_SEARCH", "https://qbzmt.spotbye.qzz.io/api/search?q=%s"))
 
+	// Lyrics: Spotify color-lyrics needs the sp_dc cookie (authenticated token).
+	put("lyrics.spotify_sp_dc", strings.TrimSpace(os.Getenv("SPOTIFY_SP_DC")))
+	put("lyrics.spotify_totp_secret", strings.TrimSpace(os.Getenv("SPOTIFY_TOTP_SECRET")))
+	put("lyrics.spotify_totp_version", strings.TrimSpace(os.Getenv("SPOTIFY_TOTP_VERSION")))
+	put("lyrics.provider_order", strings.TrimSpace(os.Getenv("LYRICS_PROVIDER_ORDER")))
+
 	return seed
 }

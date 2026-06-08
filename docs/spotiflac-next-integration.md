@@ -53,30 +53,32 @@ attempted (toggle with `ENFORCE_ACTIVE_METHODS`; cache TTL `STATUS_CACHE_TTL`).
 chain as SpotiFLAC-Next (LRCLib → Musixmatch → Spotify color-lyrics), provided
 by the upstream `backend.LyricsClient.FetchLyricsAllSources`.
 
-## Keeping C2 up to date (scripts + updater)
+## Keeping C2 up to date (the `spotiflac-updater` branch)
 
 The C2 addresses change between SpotiFLAC-Next builds, so nothing is hard-coded
-permanently. Tooling:
+permanently. All the maintenance tooling lives on the **`spotiflac-updater`**
+branch (this `master` branch is the deployable API only), cloned to the host and
+run from systemd timers. That branch carries:
 
-- **`scripts/extract-spotiflac-next.py`** — statically extracts a
-  `c2-manifest.json` (hosts, endpoints, lyric/metadata providers, status source,
-  UA, version) from a binary/`.app`. `--diff` for change review, `--emit-sql`.
-- **`scripts/update-c2-from-binary.sh`** — extract → diff → (with `--apply`)
+- **`extract-spotiflac-next.py`** — statically extracts a `c2-manifest.json`
+  (hosts, endpoints, lyric/metadata providers, status source, UA, version) from a
+  binary/`.app`. `--diff` for change review, `--emit-sql`.
+- **`update-c2-from-binary.sh`** — extract → diff → (with `--apply`)
   `POST /admin/c2/import`.
-- **`scripts/fetch-latest-next.py`** — resolves the supporter gist
-  (`b2f7b815…`) → its Google Drive folder → downloads the latest macOS `.dmg`
-  (gdown) → extracts the `.app` (hdiutil/7z) → returns `{version, binary}`.
-- **`scripts/fetch-monochrome-instances.py`** — parses the canonical
+- **`fetch-latest-next.py`** — resolves the supporter gist (`b2f7b815…`) → its
+  Google Drive folder → downloads the latest macOS `.dmg` (gdown) → extracts the
+  `.app` (hdiutil/7z) → returns `{version, binary}`.
+- **`fetch-monochrome-instances.py`** — parses the canonical
   [monochrome INSTANCES.md](https://github.com/monochrome-music/monochrome/blob/main/INSTANCES.md)
   and writes `monochrome.api_instances` / `streaming_instances` /
   `discovery_urls` settings (no longer hard-coded in `.env`).
-- **`updater/check-c2-updates.sh`** — the orchestrator (run from the same host
-  timer as `update.sh`): refreshes monochrome instances every run, detects a new
-  SpotiFLAC-Next version, extracts + diffs its C2, and with `--apply` imports the
-  changes into the running API. Records the last seen version in `STATE_DIR`.
+- **`check-c2-updates.sh`** — the orchestrator: refreshes monochrome instances
+  every run, detects a new SpotiFLAC-Next version, extracts + diffs its C2, and
+  with `--apply` imports the changes into the running API. Records the last seen
+  version in `STATE_DIR`.
 
-In production (Coolify + docker compose) the updater runs on the host and POSTs
-to the API; the SQLite store persists on the `c2-data` volume across redeploys.
+The running API exposes `POST /admin/c2/import` to ingest a manifest, and the
+SQLite store persists on the `c2-data` Docker volume across Coolify redeploys.
 
 ## DNS reality of the spotbye hosts (verified 2026-06)
 
