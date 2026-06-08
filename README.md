@@ -129,6 +129,8 @@ nano .env
 | `COOLIFY_REDEPLOY_URL` | Coolify webhook URL to trigger a deploy. Obtain from the application settings page in Coolify. |
 | `UPTIME_KUMA_UPDATE_PUSH_URL` | Optional Uptime Kuma Push Monitor URL for updates (notifies OK/DOWN). |
 | `UPTIME_KUMA_DAILY_SMOKE_PUSH_URL` | Optional Uptime Kuma Push Monitor URL for the daily smoke test. |
+| `TELEGRAM_NOTIFY_TOKEN` | Optional. Bearer token for the Alfred Telegram bot. When set, `update.sh` and `check-c2-updates.sh` send a message on new upstream/SpotiFLAC-Next versions, C2 endpoint changes, deploys, and rollbacks. Blank disables notifications. |
+| `TELEGRAM_NOTIFY_URL` | Telegram bot endpoint (default `https://alfred-telegram.naz4ri.music/`). |
 
 ---
 

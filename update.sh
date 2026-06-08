@@ -35,6 +35,13 @@ log_error() {
   echo -e "${RED}[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR]${NC} $1" >&2
 }
 
+# Telegram notifications (no-op unless TELEGRAM_NOTIFY_TOKEN is set in .env).
+if [ -f "${SCRIPT_DIR}/notify.sh" ]; then
+  source "${SCRIPT_DIR}/notify.sh"
+else
+  notify_telegram() { :; }
+fi
+
 # 1. Acquire process lock to avoid parallel checks
 LOCK_FILE="${SCRIPT_DIR}/.update.lock"
 exec 200>"$LOCK_FILE"
@@ -224,6 +231,9 @@ if [ "$GO_CHANGED" = "false" ] && [ "$PYTHON_CHANGED" = "false" ]; then
 fi
 
 log_info "New upstream version detected: updating (Go changed=${GO_CHANGED}, Python changed=${PYTHON_CHANGED})..."
+notify_telegram "SpotiFLAC: nueva versión detectada" "Iniciando build/test/deploy.
+Go changed: ${GO_CHANGED} (${LOCAL_GO_SHA:-?} -> ${GO_REMOTE_SHORT_SHA})
+Python changed: ${PYTHON_CHANGED} (${LOCAL_PYTHON_SHA:-?} -> ${PYTHON_REMOTE_SHORT_SHA})"
 
 # 6. Clone main branch temporarily to WORKDIR
 log_info "Cleaning up old workdir and cloning main branch..."
@@ -412,6 +422,8 @@ if [ "$SMOKE_PASSED" = false ]; then
   fi
   
   push_uptime_kuma "down" "Deploy failed for update: $(IFS=' / '; echo "${COMMIT_PARTS[*]}") - Rollback initiated."
+  notify_telegram "⚠️ SpotiFLAC: update FALLÓ (rollback)" "El deploy/smoke falló y se hizo git revert en ${APP_BRANCH}.
+Update: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")"
   rm -rf "$WORKDIR"
   exit 1
 fi
@@ -428,5 +440,8 @@ if [ "$PYTHON_CHANGED" = "true" ]; then
 fi
 
 push_uptime_kuma "up" "Successfully updated and deployed SpotiFLAC providers: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")"
+notify_telegram "✅ SpotiFLAC: actualizado y desplegado" "Push a ${APP_BRANCH} + redeploy Coolify OK, smoke test pasado.
+Cambios: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")
+Go: ${GO_REMOTE_SHORT_SHA} | Python: ${PYTHON_REMOTE_SHORT_SHA}"
 rm -rf "$WORKDIR"
 exit 0

@@ -51,6 +51,10 @@ done
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
+# Telegram notifications (no-op unless TELEGRAM_NOTIFY_TOKEN is set).
+if [[ -f "$SCRIPT_DIR/.env" ]]; then set -a; source "$SCRIPT_DIR/.env"; set +a; fi
+if [[ -f "$SCRIPT_DIR/notify.sh" ]]; then source "$SCRIPT_DIR/notify.sh"; else notify_telegram() { :; }; fi
+
 mkdir -p "$STATE_DIR"
 LAST_VERSION_FILE="$STATE_DIR/last_next_version"
 LAST_VERSION="$(cat "$LAST_VERSION_FILE" 2>/dev/null || echo "")"
@@ -96,16 +100,31 @@ log "New version detected: $LAST_VERSION -> $VERSION"
 NEW_MANIFEST="$WORKDIR/c2-manifest.json"
 python3 "$EXTRACTOR" "$BINARY" -o "$NEW_MANIFEST"
 
+C2_DIFF="(no reference manifest to diff against)"
 if [[ -f "$REF_MANIFEST" ]]; then
   log "C2 changes vs reference:"
-  python3 "$EXTRACTOR" "$BINARY" --diff "$REF_MANIFEST" || true
+  C2_DIFF="$(python3 "$EXTRACTOR" "$BINARY" --diff "$REF_MANIFEST" 2>/dev/null || true)"
+  echo "$C2_DIFF"
 fi
 
+APPLIED_NOTE="(dry-run; not applied)"
 if [[ "$APPLY" == "1" ]]; then
   log "Importing new C2 into API at $API_BASE_URL"
-  curl -fsS -X POST "$API_BASE_URL/admin/c2/import" \
-    -H 'Content-Type: application/json' --data-binary "@$NEW_MANIFEST" && echo
+  if curl -fsS -X POST "$API_BASE_URL/admin/c2/import" \
+      -H 'Content-Type: application/json' --data-binary "@$NEW_MANIFEST"; then
+    echo
+    APPLIED_NOTE="Imported into the running API."
+  else
+    APPLIED_NOTE="Import to API FAILED."
+  fi
 fi
+
+# Notify about the new SpotiFLAC-Next version and its C2 changes.
+notify_telegram "🆕 SpotiFLAC-Next ${VERSION} detectado" "Versión anterior: ${LAST_VERSION:-ninguna}
+${APPLIED_NOTE}
+
+Cambios de C2/endpoints:
+${C2_DIFF}"
 
 # Persist the reference manifest and the seen version.
 cp "$NEW_MANIFEST" "$REF_MANIFEST"
