@@ -500,8 +500,9 @@ func (s *apiServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":  true,
-		"now": time.Now().UTC(),
+		"ok":                true,
+		"now":               time.Now().UTC(),
+		"spotiflac_version": spotiflacModuleVersion(),
 	})
 }
 
