@@ -32,7 +32,10 @@ source of truth; `.env` only seeds an empty DB on first boot. Manage it at:
 - `GET /admin/` — web UI (editable table). Protect it at your reverse proxy
   (e.g. HTTP basic auth); the panel works at `/admin/` or behind a subpath.
 - `GET/POST /admin/c2`, `PUT/DELETE /admin/c2/{id}`, `PUT /admin/settings/{key}`
-- `POST /admin/c2/import` — bulk-import a `c2-manifest.json`
+- `POST /admin/c2/import` — bulk-import a `c2-manifest.json`. **Replaces** the
+  whole C2 endpoint list with the manifest's (old endpoints discarded, so it
+  never grows across releases); operator settings (API keys, sp_dc, Monochrome
+  lists) are preserved.
 - `POST /admin/c2/reload` — reload the cache
 
 ## Status and gating

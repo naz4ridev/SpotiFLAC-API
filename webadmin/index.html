@@ -59,7 +59,7 @@
 
   <details>
     <summary>Import c2-manifest.json (bulk)</summary>
-    <p><small class="hint">Paste a manifest produced by the extractor on the <code>spotiflac-updater</code> branch. Existing rows are updated; nothing is deleted.</small></p>
+    <p><small class="hint">Paste a manifest produced by the extractor on the <code>spotiflac-updater</code> branch. <strong>Replaces</strong> the C2 endpoint list with this version's (old endpoints are discarded); operator settings (API keys, sp_dc cookie, Monochrome lists) are kept.</small></p>
     <textarea id="manifest" placeholder='{"endpoints": {...}, "public_providers": {...}}'></textarea>
     <div class="toolbar"><button id="import">Import manifest</button></div>
   </details>

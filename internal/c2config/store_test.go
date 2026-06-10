@@ -113,3 +113,32 @@ func TestImportManifest(t *testing.T) {
 		t.Fatalf("qobuz endpoint not imported: %v", urls)
 	}
 }
+
+func TestImportManifestReplacesEndpoints(t *testing.T) {
+	s := newTestStore(t)
+
+	// A pre-existing / manually-added endpoint and an operator API key.
+	if _, err := s.UpsertEndpoint(Endpoint{Service: "stale", Role: "download", URL: "https://old", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSetting("spotbye.deezer_api_key", "SECRET"); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := []byte(`{"endpoints":{"qobuz.download":{"service":"qobuz","role":"download","host":"h","example_url":"https://new"}},"public_providers":{}}`)
+	if _, _, err := s.ImportManifest(raw); err != nil {
+		t.Fatalf("ImportManifest: %v", err)
+	}
+
+	// The stale endpoint must be gone (replaced, not accumulated).
+	if urls := s.EnabledURLs("stale", "download"); len(urls) != 0 {
+		t.Fatalf("stale endpoint should have been discarded, got %v", urls)
+	}
+	if eps := s.Endpoints(); len(eps) != 1 || eps[0].Service != "qobuz" {
+		t.Fatalf("expected only the new qobuz endpoint, got %+v", eps)
+	}
+	// Operator settings must survive an import.
+	if got := s.Setting("spotbye.deezer_api_key", ""); got != "SECRET" {
+		t.Fatalf("operator API key was clobbered by import: %q", got)
+	}
+}

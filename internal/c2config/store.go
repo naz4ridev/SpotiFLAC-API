@@ -333,30 +333,56 @@ type manifest struct {
 // ImportManifest bulk-applies a c2-manifest.json. Endpoints become c2_endpoints
 // rows (variant ""); public providers and the status source become settings.
 // Existing rows are updated in place; nothing is deleted. Returns counts.
+// ImportManifest REPLACES the C2 endpoint set with the manifest's: every existing
+// c2_endpoints row is deleted and only the new version's endpoints are inserted,
+// so the list never accumulates stale hosts across releases. Operator settings
+// (API keys, sp_dc cookie, Monochrome lists, ...) are preserved — only the
+// version-derived settings (endpoint.* providers, status.source_url) are upserted.
+// The endpoint replacement is transactional: on any error nothing changes.
 func (s *Store) ImportManifest(raw []byte) (endpoints, settings int, err error) {
 	var m manifest
 	if err = json.Unmarshal(raw, &m); err != nil {
 		return 0, 0, fmt.Errorf("parse manifest: %w", err)
 	}
+
 	// Deterministic order for predictable logs.
 	keys := make([]string, 0, len(m.Endpoints))
 	for k := range m.Endpoints {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Discard the previous version's endpoints entirely.
+	if _, err = tx.Exec(`DELETE FROM c2_endpoints`); err != nil {
+		return 0, 0, fmt.Errorf("clear endpoints: %w", err)
+	}
 	for _, k := range keys {
 		ep := m.Endpoints[k]
 		if ep.ExampleURL == "" {
 			continue
 		}
-		if _, err = s.UpsertEndpoint(Endpoint{
-			Service: ep.Service, Role: ep.Role, Variant: "",
-			URL: ep.ExampleURL, Enabled: true,
-		}); err != nil {
-			return endpoints, settings, err
+		if _, err = tx.Exec(`INSERT INTO c2_endpoints(service, role, variant, url, enabled, priority, notes, updated_at)
+			VALUES(?,?,?,?,1,0,'',?)`, ep.Service, ep.Role, "", ep.ExampleURL, now); err != nil {
+			return 0, 0, fmt.Errorf("insert endpoint %s: %w", k, err)
 		}
 		endpoints++
 	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit: %w", err)
+	}
+
+	// Version-derived settings are upserted (operator settings are untouched).
 	for name, url := range m.PublicProviders {
 		if url == "" {
 			continue
@@ -371,6 +397,9 @@ func (s *Store) ImportManifest(raw []byte) (endpoints, settings int, err error) 
 			return endpoints, settings, err
 		}
 		settings++
+	}
+	if err = s.Reload(); err != nil {
+		return endpoints, settings, err
 	}
 	return endpoints, settings, nil
 }
