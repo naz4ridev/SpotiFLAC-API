@@ -40,16 +40,32 @@ GIST_ID="${SPOTIFLAC_NEXT_GIST:-b2f7b815b1560d7a58d7dd847f073f00}"
 APPLY=0
 FORCE_VERSION=""
 
+NO_NOTIFY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply) APPLY=1; shift ;;
     --version) FORCE_VERSION="$2"; shift 2 ;;
+    --no-notify) NO_NOTIFY=1; shift ;;  # caller (update.sh) sends a consolidated notification
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+# write_summary records the detected versions so update.sh can include them in a
+# single consolidated Telegram notification.
+SUMMARY_FILE="${STATE_DIR}/refresh-summary.env"
+write_summary() {
+  {
+    echo "NEXT_VERSION=${NEXT_VERSION:-unknown}"
+    echo "NEXT_PREV_VERSION=${LAST_VERSION:-}"
+    echo "NEXT_CHANGED=${NEXT_CHANGED:-false}"
+    echo "MONO_API_COUNT=${MONO_API_COUNT:-0}"
+    echo "MONO_STREAM_COUNT=${MONO_STREAM_COUNT:-0}"
+    echo "MONO_CHANGED=${MONO_CHANGED:-false}"
+  } > "$SUMMARY_FILE"
+}
 
 # Telegram notifications (no-op unless TELEGRAM_NOTIFY_TOKEN is set).
 if [[ -f "$SCRIPT_DIR/.env" ]]; then set -a; source "$SCRIPT_DIR/.env"; set +a; fi
@@ -61,13 +77,33 @@ LAST_VERSION="$(cat "$LAST_VERSION_FILE" 2>/dev/null || echo "")"
 
 # Refresh Monochrome instances from the canonical INSTANCES.md (independent of
 # the SpotiFLAC-Next release cycle; community instances change on their own).
+MONO_API_COUNT=0
+MONO_STREAM_COUNT=0
+MONO_CHANGED=false
 MONO_FETCHER="$API_SCRIPTS_DIR/fetch-monochrome-instances.py"
 if [[ -f "$MONO_FETCHER" ]]; then
   log "Refreshing Monochrome instances from upstream INSTANCES.md..."
+  # Parse the current list once (to count + detect change), then apply it. The
+  # API stores it as a single CSV setting, so applying fully REPLACES the list —
+  # only the latest instances are kept, nothing accumulates.
+  MONO_JSON="$(python3 "$MONO_FETCHER" --json 2>/dev/null || echo '{}')"
+  MONO_API_COUNT=$(echo "$MONO_JSON" | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("api_instances",[])))' 2>/dev/null || echo 0)
+  MONO_STREAM_COUNT=$(echo "$MONO_JSON" | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("streaming_instances",[])))' 2>/dev/null || echo 0)
+  # Detect whether the instance set changed since last run (stable signature).
+  MONO_SIG=$(echo "$MONO_JSON" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(",".join(sorted(d.get("api_instances",[])+d.get("streaming_instances",[]))))' 2>/dev/null || echo "")
+  MONO_SIG_FILE="$STATE_DIR/last_monochrome_sig"
+  if [[ -n "$MONO_SIG" && "$MONO_SIG" != "$(cat "$MONO_SIG_FILE" 2>/dev/null || echo)" ]]; then
+    MONO_CHANGED=true
+  fi
   if [[ "$APPLY" == "1" ]]; then
-    python3 "$MONO_FETCHER" --apply --api "$API_BASE_URL" || log "monochrome refresh failed (non-fatal)"
+    if python3 "$MONO_FETCHER" --apply --api "$API_BASE_URL"; then
+      [[ -n "$MONO_SIG" ]] && echo "$MONO_SIG" > "$MONO_SIG_FILE"
+      log "Monochrome instances applied (${MONO_API_COUNT} API, ${MONO_STREAM_COUNT} streaming; replaced in full)."
+    else
+      log "monochrome refresh failed (non-fatal)"
+    fi
   else
-    python3 "$MONO_FETCHER" --json >/dev/null && log "monochrome list parsed OK (dry-run; use --apply to push)" || log "monochrome parse failed (non-fatal)"
+    log "monochrome list parsed: ${MONO_API_COUNT} API instances (dry-run; use --apply to push)"
   fi
 fi
 
@@ -90,12 +126,16 @@ FETCH_JSON="$("$VENV/bin/python3" "$FETCHER" "${FETCH_ARGS[@]}")"
 VERSION="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
 BINARY="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["binary"])')"
 log "Latest version: $VERSION (binary: $BINARY)"
+NEXT_VERSION="$VERSION"
 
 if [[ "$VERSION" == "$LAST_VERSION" ]]; then
-  log "No new version (current: $LAST_VERSION). Nothing to do."
+  log "No new SpotiFLAC-Next version (current: $LAST_VERSION)."
+  NEXT_CHANGED=false
+  write_summary
   exit 0
 fi
 log "New version detected: $LAST_VERSION -> $VERSION"
+NEXT_CHANGED=true
 
 NEW_MANIFEST="$WORKDIR/c2-manifest.json"
 python3 "$EXTRACTOR" "$BINARY" -o "$NEW_MANIFEST"
@@ -119,12 +159,18 @@ if [[ "$APPLY" == "1" ]]; then
   fi
 fi
 
-# Notify about the new SpotiFLAC-Next version and its C2 changes.
-notify_telegram "🆕 SpotiFLAC-Next ${VERSION} detectado" "Versión anterior: ${LAST_VERSION:-ninguna}
+write_summary
+
+# Notify about the new SpotiFLAC-Next version and its C2 changes — unless the
+# caller (update.sh) will send a single consolidated notification.
+if [[ "$NO_NOTIFY" != "1" ]]; then
+  notify_telegram "🆕 SpotiFLAC-Next ${VERSION} detectado" "Versión anterior: ${LAST_VERSION:-ninguna}
 ${APPLIED_NOTE}
+Monochrome: ${MONO_API_COUNT} API instances$([ "$MONO_CHANGED" = true ] && echo ' (cambió)')
 
 Cambios de C2/endpoints:
 ${C2_DIFF}"
+fi
 
 # Persist the reference manifest and the seen version.
 cp "$NEW_MANIFEST" "$REF_MANIFEST"

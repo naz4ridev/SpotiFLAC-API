@@ -49,17 +49,34 @@ fi
 # updates them dynamically instead of relying on hard-coded values. The
 # SpotiFLAC (Go upstream) endpoints are refreshed by deploying the new module
 # (it resolves them dynamically at runtime).
+# Detected versions, populated by refresh_endpoints (for notifications).
+NEXT_VERSION="unknown"; NEXT_CHANGED="false"; MONO_API_COUNT="?"; MONO_CHANGED="false"
 refresh_endpoints() {
   if [ ! -x "${SCRIPT_DIR}/check-c2-updates.sh" ]; then
     log_warn "check-c2-updates.sh not found; skipping dynamic endpoint refresh."
     return 0
   fi
   log_info "Refreshing dynamic endpoints (Monochrome + SpotiFLAC-Next C2)..."
-  if API_BASE_URL="${BASE_URL%/}" "${SCRIPT_DIR}/check-c2-updates.sh" --apply; then
+  # --no-notify: update.sh sends a single consolidated notification with all versions.
+  if API_BASE_URL="${BASE_URL%/}" "${SCRIPT_DIR}/check-c2-updates.sh" --apply --no-notify; then
     log_info "Endpoint refresh completed."
   else
     log_warn "Endpoint refresh reported issues (continuing)."
   fi
+  # Load the versions check-c2-updates.sh detected (SpotiFLAC-Next + Monochrome).
+  if [ -f "${STATE_DIR}/refresh-summary.env" ]; then
+    # shellcheck source=/dev/null
+    source "${STATE_DIR}/refresh-summary.env" || true
+  fi
+}
+
+# versions_block prints the new detected version of each component for notifications.
+versions_block() {
+  printf '• spotiflac: %s (%s)\n• python: %s\n• spotiflac-next: %s%s\n• monochrome: %s API instances%s' \
+    "${GO_REMOTE_VERSION:-?}" "${GO_REMOTE_SHORT_SHA:-?}" \
+    "${PYTHON_REMOTE_SHORT_SHA:-?}" \
+    "${NEXT_VERSION:-?}" "$([ "${NEXT_CHANGED}" = true ] && echo ' (nueva)')" \
+    "${MONO_API_COUNT:-?}" "$([ "${MONO_CHANGED}" = true ] && echo ' (cambió)')"
 }
 
 # 1. Acquire process lock to avoid parallel checks
@@ -240,6 +257,14 @@ if [ "$GO_CHANGED" = "false" ] && [ "$PYTHON_CHANGED" = "false" ]; then
   # rotate independently of the Go module, and the running app must follow them.
   refresh_endpoints
 
+  # If SpotiFLAC-Next or Monochrome changed (no Go/Python change here), notify.
+  if [ "${NEXT_CHANGED}" = "true" ] || [ "${MONO_CHANGED}" = "true" ]; then
+    notify_telegram "🔄 SpotiFLAC: endpoints actualizados (sin cambio de código)" "SpotiFLAC-Next/Monochrome cambiaron; endpoints refrescados en la API.
+
+Versiones detectadas:
+$(versions_block)"
+  fi
+
   # Check if production API is currently healthy
   log_info "Verifying health of production service..."
   BASE_URL="${BASE_URL%/}"
@@ -255,9 +280,13 @@ if [ "$GO_CHANGED" = "false" ] && [ "$PYTHON_CHANGED" = "false" ]; then
 fi
 
 log_info "New upstream version detected: updating (Go changed=${GO_CHANGED}, Python changed=${PYTHON_CHANGED})..."
-notify_telegram "SpotiFLAC: nueva versión detectada" "Iniciando build/test/deploy.
-Go changed: ${GO_CHANGED} (${LOCAL_GO_SHA:-?} -> ${GO_REMOTE_SHORT_SHA})
-Python changed: ${PYTHON_CHANGED} (${LOCAL_PYTHON_SHA:-?} -> ${PYTHON_REMOTE_SHORT_SHA})"
+
+# Refresh endpoints now so the notification and the post-deploy smoke use the
+# current providers (writes to the SQLite volume the new container will read).
+refresh_endpoints
+
+notify_telegram "SpotiFLAC: nueva versión detectada" "Iniciando build/test/deploy. Versiones detectadas:
+$(versions_block)"
 
 # 6. Clone main branch temporarily to WORKDIR
 log_info "Cleaning up old workdir and cloning main branch..."
@@ -409,9 +438,8 @@ done
 # 11. Run smoke test on deployed API
 SMOKE_PASSED=false
 if [ "$SERVICE_UP" = true ]; then
-  # Refresh C2 endpoints against the freshly deployed API so the strict smoke
-  # download is validated against the current providers.
-  refresh_endpoints
+  # Endpoints were already refreshed pre-deploy (into the persistent SQLite
+  # volume the new container reads), so the smoke validates current providers.
   log_info "Running post-deploy smoke test..."
   if SMOKE_STRATEGY="${SMOKE_STRATEGY}" "${SCRIPT_DIR}/smoke-test.sh"; then
     SMOKE_PASSED=true
@@ -450,7 +478,9 @@ if [ "$SMOKE_PASSED" = false ]; then
   
   push_uptime_kuma "down" "Deploy failed for update: $(IFS=' / '; echo "${COMMIT_PARTS[*]}") - Rollback initiated."
   notify_telegram "⚠️ SpotiFLAC: update FALLÓ (rollback)" "El deploy/smoke falló y se hizo git revert en ${APP_BRANCH}.
-Update: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")"
+
+Versiones detectadas:
+$(versions_block)"
   rm -rf "$WORKDIR"
   exit 1
 fi
@@ -468,7 +498,8 @@ fi
 
 push_uptime_kuma "up" "Successfully updated and deployed SpotiFLAC providers: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")"
 notify_telegram "✅ SpotiFLAC: actualizado y desplegado" "Push a ${APP_BRANCH} + redeploy Coolify OK, smoke test pasado.
-Cambios: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")
-Go: ${GO_REMOTE_SHORT_SHA} | Python: ${PYTHON_REMOTE_SHORT_SHA}"
+
+Versiones nuevas:
+$(versions_block)"
 rm -rf "$WORKDIR"
 exit 0
