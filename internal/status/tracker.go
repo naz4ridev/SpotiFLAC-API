@@ -122,6 +122,46 @@ func (t *Tracker) ServiceActive(ctx context.Context, service string) bool {
 	return st.Active
 }
 
+// ActiveVariants returns the variant keys reported "up" for a service, ordered
+// a..e then x (then any others), e.g. ["a","b","c","d","e","x"]. Used to build
+// the live SpotiFLAC-Next Shared/Community pool hosts ({svc}-{variant}...).
+func (t *Tracker) ActiveVariants(ctx context.Context, service string) []string {
+	snap := t.Get(ctx)
+	if snap == nil || snap.Next == nil {
+		return nil
+	}
+	st, ok := snap.Next[strings.ToLower(service)]
+	if !ok {
+		return nil
+	}
+	rank := func(v string) int {
+		switch v {
+		case "a":
+			return 0
+		case "b":
+			return 1
+		case "c":
+			return 2
+		case "d":
+			return 3
+		case "e":
+			return 4
+		case "x":
+			return 5
+		default:
+			return 6
+		}
+	}
+	var up []string
+	for v, isUp := range st.Variants {
+		if isUp {
+			up = append(up, v)
+		}
+	}
+	sort.Slice(up, func(i, j int) bool { return rank(up[i]) < rank(up[j]) })
+	return up
+}
+
 func (t *Tracker) refresh(ctx context.Context) *Snapshot {
 	snap := &Snapshot{
 		CheckedAt: time.Now().UTC(),

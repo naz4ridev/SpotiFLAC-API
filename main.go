@@ -42,7 +42,7 @@ var (
 		"amazon": {},
 		"deezer": {}, // served by the spotbye engine (upstream skips it)
 	}
-	defaultServices = []string{"tidal", "qobuz", "amazon"}
+	defaultServices = []string{"tidal", "qobuz", "amazon", "deezer"}
 )
 
 const (
@@ -955,7 +955,15 @@ func (p *GoProvider) Download(ctx context.Context, req downloadRequest) download
 		// AES-GCM-decrypted "community" C2 endpoints baked into the module
 		// (exactly like SpotiFLAC/SpotiFLAC-Next; no hard-coded hosts). Then
 		// monochrome as a fallback.
-		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
+		spotbyePath, spotbyeService, spotbyeAttempts, spotbyeErr := p.server.resolveWithSpotbye(ctx, req.Metadata, req.ServiceOrder, req.OutputDir)
+		attempts = append(attempts, spotbyeAttempts...)
+		if spotbyeErr == nil {
+			downloadPath, serviceUsed, res.MethodUsed = spotbyePath, spotbyeService, downloadEngineSpotbye
+			break
+		}
+		var spotiflacAttempts []attempt
+		downloadPath, serviceUsed, spotiflacAttempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
+		attempts = append(attempts, spotiflacAttempts...)
 		res.MethodUsed = downloadEngineSpotiFLAC
 		if err != nil {
 			monochromePath, monochromeAttempts, monochromeErr := p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
@@ -966,7 +974,7 @@ func (p *GoProvider) Download(ctx context.Context, req downloadRequest) download
 				res.MethodUsed = downloadEngineMonochrome
 				err = nil
 			} else {
-				err = fmt.Errorf("spotiflac failed: %v; monochrome failed: %w", err, monochromeErr)
+				err = fmt.Errorf("spotbye failed: %v; spotiflac failed: %v; monochrome failed: %w", spotbyeErr, err, monochromeErr)
 			}
 		}
 	}
