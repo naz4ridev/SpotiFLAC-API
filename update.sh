@@ -79,6 +79,26 @@ versions_block() {
     "${MONO_API_COUNT:-?}" "$([ "${MONO_CHANGED}" = true ] && echo ' (cambió)')"
 }
 
+# trigger_coolify_deploy hits the Coolify redeploy URL, sending the API bearer
+# token (COOLIFY_API_TOKEN) when set, and logs the HTTP status + response body so
+# failures are diagnosable instead of a silent "non-200". Coolify's API deploy
+# endpoint (/api/v1/deploy?uuid=...) REQUIRES the token. Returns 0 only on 2xx.
+trigger_coolify_deploy() {
+  local hdr=()
+  [ -n "${COOLIFY_API_TOKEN:-}" ] && hdr=(-H "Authorization: Bearer ${COOLIFY_API_TOKEN}")
+  local out code body
+  out=$(curl -sS -m 30 -X GET "${hdr[@]}" -w $'\n%{http_code}' "${COOLIFY_REDEPLOY_URL}" 2>&1) || true
+  code=$(printf '%s' "$out" | tail -n1)
+  body=$(printf '%s' "$out" | sed '$d' | head -c 500)
+  log_info "Coolify redeploy -> HTTP ${code}"
+  [ -n "$body" ] && log_info "Coolify response: ${body}"
+  case "$code" in
+    2*) return 0 ;;
+    401|403) log_warn "Coolify auth failed (HTTP ${code}). Set COOLIFY_API_TOKEN in .env (Coolify API token)."; return 1 ;;
+    *) log_warn "Coolify redeploy returned HTTP ${code} (expected 2xx)."; return 1 ;;
+  esac
+}
+
 # 1. Acquire process lock to avoid parallel checks
 LOCK_FILE="${SCRIPT_DIR}/.update.lock"
 exec 200>"$LOCK_FILE"
@@ -407,8 +427,8 @@ if [ -z "${COOLIFY_REDEPLOY_URL:-}" ]; then
 fi
 
 log_info "Triggering Coolify redeployment..."
-if ! curl -fsSL -m 30 -X GET "${COOLIFY_REDEPLOY_URL}" >/dev/null 2>&1; then
-  log_warn "Coolify webhook call returned non-200 or timed out. Checking deployment health anyway..."
+if ! trigger_coolify_deploy; then
+  log_warn "Coolify redeploy did not return 2xx (see HTTP code above). Checking deployment health anyway..."
 fi
 
 # 10. Poll /health to verify deployment.
@@ -484,7 +504,7 @@ if [ "$SMOKE_PASSED" = false ]; then
     log_info "Revert commit created. Pushing to remote '${APP_BRANCH}'..."
     if git push origin "${APP_BRANCH}" 2>&1; then
       log_info "Push successful. Re-triggering Coolify deployment for rollback..."
-      curl -fsSL -m 30 -X GET "${COOLIFY_REDEPLOY_URL}" >/dev/null 2>&1 || true
+      trigger_coolify_deploy || true
       
       log_info "Waiting for restored service to recover..."
       for i in {1..30}; do
