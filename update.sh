@@ -406,16 +406,23 @@ rm -f .env
 
 log_info "All build, test, and container compilation checks passed! Preparing commit..."
 
-# 8. Commit changes and push to remote main branch
+# 8. Commit changes and push to remote main branch.
+# If nothing is staged, ${APP_BRANCH} is already at the target version (e.g. a
+# previous run pushed the bump but never finished deploying) — skip the commit
+# (a bare `git commit` would exit non-zero and abort under `set -e`) and proceed
+# straight to (re)deploy + smoke so the already-committed version gets validated.
 COMMIT_MSG="Auto-update providers: $(IFS=' / '; echo "${COMMIT_PARTS[*]}")"
-git commit -m "$COMMIT_MSG"
-
-log_info "Pushing commit to remote branch '${APP_BRANCH}'..."
-if ! git push origin "${APP_BRANCH}" 2>&1; then
-  log_error "Failed to push updates to remote Git repository."
-  push_uptime_kuma "down" "Error: Failed to push updates to remote Git branch."
-  rm -rf "$WORKDIR"
-  exit 1
+if git diff --cached --quiet; then
+  log_warn "Nothing to commit — '${APP_BRANCH}' is already at the target version. Proceeding to (re)deploy and validate it."
+else
+  git commit -m "$COMMIT_MSG"
+  log_info "Pushing commit to remote branch '${APP_BRANCH}'..."
+  if ! git push origin "${APP_BRANCH}" 2>&1; then
+    log_error "Failed to push updates to remote Git repository."
+    push_uptime_kuma "down" "Error: Failed to push updates to remote Git branch."
+    rm -rf "$WORKDIR"
+    exit 1
+  fi
 fi
 
 # 9. Trigger Coolify deployment

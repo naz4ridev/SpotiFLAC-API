@@ -62,11 +62,32 @@ def require_gdown():
 
 
 def download_folder(folder_id: str, dest: str) -> str:
-    """Download the Drive folder tree into dest, returning the local root path."""
+    """Download the Drive folder tree into dest, returning the local root path.
+
+    gdown's download_folder signature varies across versions (e.g. remaining_ok
+    and use_cookies aren't always accepted), so we try the richest call and fall
+    back to progressively simpler ones on TypeError."""
     gdown = require_gdown()
     url = f"https://drive.google.com/drive/folders/{folder_id}"
     log(f">> Downloading Drive folder {folder_id} (this may be large)...")
-    paths = gdown.download_folder(url, output=dest, quiet=False, use_cookies=False, remaining_ok=True)
+    attempts = (
+        dict(output=dest, quiet=False, use_cookies=False, remaining_ok=True),
+        dict(output=dest, quiet=False, remaining_ok=True),
+        dict(output=dest, quiet=False, use_cookies=False),
+        dict(output=dest, quiet=False),
+        dict(output=dest),
+    )
+    paths = None
+    last_err: Exception | None = None
+    for kwargs in attempts:
+        try:
+            paths = gdown.download_folder(url, **kwargs)
+            break
+        except TypeError as e:
+            last_err = e  # unsupported kwarg for this gdown version; try simpler
+            continue
+    else:
+        raise SystemExit(f"gdown.download_folder failed for all signatures: {last_err}")
     if not paths:
         raise SystemExit("gdown downloaded nothing from the folder")
     return dest
