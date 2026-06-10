@@ -42,6 +42,26 @@ else
   notify_telegram() { :; }
 fi
 
+# refresh_endpoints brings the running API's C2 config up to date BEFORE the
+# strict smoke test: it refreshes the Monochrome instance list (INSTANCES.md)
+# and detects/imports any new SpotiFLAC-Next version's endpoints. This is what
+# makes the app resilient to endpoint changes between releases — the updater
+# updates them dynamically instead of relying on hard-coded values. The
+# SpotiFLAC (Go upstream) endpoints are refreshed by deploying the new module
+# (it resolves them dynamically at runtime).
+refresh_endpoints() {
+  if [ ! -x "${SCRIPT_DIR}/check-c2-updates.sh" ]; then
+    log_warn "check-c2-updates.sh not found; skipping dynamic endpoint refresh."
+    return 0
+  fi
+  log_info "Refreshing dynamic endpoints (Monochrome + SpotiFLAC-Next C2)..."
+  if API_BASE_URL="${BASE_URL%/}" "${SCRIPT_DIR}/check-c2-updates.sh" --apply; then
+    log_info "Endpoint refresh completed."
+  else
+    log_warn "Endpoint refresh reported issues (continuing)."
+  fi
+}
+
 # 1. Acquire process lock to avoid parallel checks
 LOCK_FILE="${SCRIPT_DIR}/.update.lock"
 exec 200>"$LOCK_FILE"
@@ -214,8 +234,12 @@ if [ "$LOCAL_PYTHON_SHA" != "$PYTHON_REMOTE_SHORT_SHA" ]; then
 fi
 
 if [ "$GO_CHANGED" = "false" ] && [ "$PYTHON_CHANGED" = "false" ]; then
-  log_info "No update required. Production is already running Go (${LOCAL_GO_SHA:-unknown}) and Python (${LOCAL_PYTHON_SHA:-unknown})."
-  
+  log_info "No Go/Python update required. Production is already running Go (${LOCAL_GO_SHA:-unknown}) and Python (${LOCAL_PYTHON_SHA:-unknown})."
+
+  # Even without a code change, refresh endpoints: SpotiFLAC-Next and Monochrome
+  # rotate independently of the Go module, and the running app must follow them.
+  refresh_endpoints
+
   # Check if production API is currently healthy
   log_info "Verifying health of production service..."
   BASE_URL="${BASE_URL%/}"
@@ -385,6 +409,9 @@ done
 # 11. Run smoke test on deployed API
 SMOKE_PASSED=false
 if [ "$SERVICE_UP" = true ]; then
+  # Refresh C2 endpoints against the freshly deployed API so the strict smoke
+  # download is validated against the current providers.
+  refresh_endpoints
   log_info "Running post-deploy smoke test..."
   if SMOKE_STRATEGY="${SMOKE_STRATEGY}" "${SCRIPT_DIR}/smoke-test.sh"; then
     SMOKE_PASSED=true

@@ -14,8 +14,18 @@ To keep the production environment clean, the updater lives in a dedicated branc
    - `go test ./...` (unit tests validation)
    - `docker compose build` (verifies Docker image compiles successfully)
 4. **Zero-Staging Deployment**: If checks pass, it pushes the updated `go.mod`/`go.sum` back to the remote `main` branch and triggers a Coolify redeploy webhook.
-5. **Post-Deploy Smoke Test**: It polls `/health`, checks `/v1/status` + `/diagnostics/providers`, and runs `smoke-test.sh`. The end-to-end download is a **soft** check by default (it depends on volatile external C2 providers); set `SMOKE_REQUIRE_DOWNLOAD=true` to make it gate the deploy.
-6. **Automatic Git Revert**: If the deploy or a *gating* check fails (health/status, or the download when `SMOKE_REQUIRE_DOWNLOAD=true`), the updater runs `git revert HEAD`, pushes the revert back to `main`, and redeploys the previous version in Coolify.
+5. **Dynamic endpoint refresh**: Before validating, the updater refreshes the C2
+   endpoints so the app follows provider changes between releases — Monochrome
+   instances (from INSTANCES.md) and SpotiFLAC-Next endpoints (extracted from the
+   latest build) are imported into the running API via `check-c2-updates.sh`. The
+   SpotiFLAC Go upstream resolves its own endpoints dynamically once deployed.
+6. **Post-Deploy Smoke Test**: Polls `/health`, checks `/v1/status` +
+   `/diagnostics/providers`, and runs `smoke-test.sh`, which performs a **real,
+   required end-to-end download** (validated with `ffprobe`) against the
+   refreshed endpoints.
+7. **Automatic Git Revert**: If the deploy or any check fails (including the
+   download), the updater runs `git revert HEAD`, pushes the revert, and
+   redeploys the previous version in Coolify.
 
 ---
 
@@ -126,7 +136,7 @@ nano .env
 | `PYTHON_UPDATE_MODE` | Upstream Python update mode: `commit`. |
 | `PYTHON_REF_FILE` | Pinned ref file inside master branch (default: `.python-spotiflac-ref`). |
 | `SMOKE_STRATEGY` | Default strategy for smoke test (default: `race`). |
-| `SMOKE_REQUIRE_DOWNLOAD` | If `true`, a failed/incomplete end-to-end download fails the smoke test (and rolls back the deploy). Default `false`: the download is a SOFT check, so transient external provider/C2 outages do **not** roll back an otherwise healthy code deploy (health/status/diagnostics/warmup still gate it). |
+| `API_BASE_URL` | API base for the C2 refresh import (`POST /admin/c2/import`); defaults to `BASE_URL`. |
 | `COOLIFY_REDEPLOY_URL` | Coolify webhook URL to trigger a deploy. Obtain from the application settings page in Coolify. |
 | `UPTIME_KUMA_UPDATE_PUSH_URL` | Optional Uptime Kuma Push Monitor URL for updates (notifies OK/DOWN). |
 | `UPTIME_KUMA_DAILY_SMOKE_PUSH_URL` | Optional Uptime Kuma Push Monitor URL for the daily smoke test. |

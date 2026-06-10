@@ -114,16 +114,13 @@ if [ "$SMOKE_WARMUP_ENABLED" = "true" ]; then
   fi
 fi
 
-# 4. Verify the end-to-end download.
+# 4. Verify the end-to-end download (a REQUIRED, gating check).
 #
-# This depends on EXTERNAL, volatile C2 providers (Tidal/Qobuz/Amazon/Deezer
-# mirrors + Monochrome) whose availability fluctuates and whose hostnames change
-# between releases. A transient provider outage must NOT roll back an otherwise
-# healthy code deploy (health/status/diagnostics/warmup already validated it), so
-# the download is a SOFT check by default. Set SMOKE_REQUIRE_DOWNLOAD=true to make
-# a failed/incomplete download fail the smoke test (and trigger a rollback).
-SMOKE_REQUIRE_DOWNLOAD=${SMOKE_REQUIRE_DOWNLOAD:-false}
-
+# This validates that a full track actually downloads with the CURRENT provider
+# endpoints. The updater refreshes Monochrome + SpotiFLAC-Next C2 endpoints (and
+# deploys the latest SpotiFLAC Go module, which resolves its endpoints
+# dynamically) BEFORE this runs, so a failure here means downloads are genuinely
+# broken — and the deploy is rolled back.
 download_check() {
   local DOWNLOAD_URL_API="${BASE_URL}/v1/download-url"
   log_info "Requesting download URL: POST ${DOWNLOAD_URL_API}"
@@ -243,12 +240,8 @@ if download_check; then
   exit 0
 fi
 
-if [ "$SMOKE_REQUIRE_DOWNLOAD" = "true" ]; then
-  log_error "Download verification failed and SMOKE_REQUIRE_DOWNLOAD=true — failing smoke test."
-  exit 1
-fi
-
-log_warn "Download verification failed, but it is a SOFT check (SMOKE_REQUIRE_DOWNLOAD!=true)."
-log_warn "Health, status, diagnostics and warmup all passed — keeping the deploy. This is"
-log_warn "usually a transient external provider/C2 outage, not a code regression."
-exit 0
+log_error "Smoke test failed: end-to-end download did not complete."
+log_error "The updater refreshes Monochrome + SpotiFLAC-Next endpoints before this step,"
+log_error "so a failure means no provider can currently deliver a full track (genuinely"
+log_error "down endpoints, a missing supporter key, or a code regression) — rolling back."
+exit 1
