@@ -149,6 +149,38 @@ if ! echo "$API_RESP" | jq -e '.ok == true' >/dev/null; then
   exit 1
 fi
 
+# The download endpoint is asynchronous: the first response returns a task_id
+# with status "pending". Poll (POST {task_id}) until it completes, fails, or the
+# overall time budget is exhausted.
+TASK_ID=$(echo "$API_RESP" | jq -r '.task_id // empty')
+STATUS=$(echo "$API_RESP" | jq -r '.status // empty')
+if [ -n "$TASK_ID" ] && [ "$STATUS" != "completed" ]; then
+  log_info "Download queued as task ${TASK_ID}; polling until ready (max ${SMOKE_MAX_TIME_SECONDS}s)..."
+  POLL_START=$(date +%s)
+  POLL_PAYLOAD=$(jq -n --arg t "$TASK_ID" '{task_id: $t}')
+  while true; do
+    sleep 3
+    POLL_RESP=$(curl -s -H "Content-Type: application/json" -d "$POLL_PAYLOAD" \
+      --connect-timeout 15 -m 60 "$DOWNLOAD_URL_API")
+    STATUS=$(echo "$POLL_RESP" | jq -r '.status // empty')
+    if [ "$STATUS" = "completed" ]; then
+      API_RESP="$POLL_RESP"
+      log_info "Download task completed."
+      break
+    fi
+    if [ "$STATUS" = "failed" ]; then
+      log_error "Download task failed: ${POLL_RESP}"
+      exit 1
+    fi
+    ELAPSED=$(( $(date +%s) - POLL_START ))
+    if [ "$ELAPSED" -ge "$SMOKE_MAX_TIME_SECONDS" ]; then
+      log_error "Download task did not complete within ${SMOKE_MAX_TIME_SECONDS}s. Last response: ${POLL_RESP}"
+      exit 1
+    fi
+    log_info "Task status: ${STATUS:-unknown} (${ELAPSED}s elapsed)..."
+  done
+fi
+
 # Validate attempts if SMOKE_REQUIRE_ALL_PROVIDERS is true
 if [ "$SMOKE_REQUIRE_ALL_PROVIDERS" = "true" ]; then
   FAILED_ATTEMPTS=$(echo "$API_RESP" | jq '[.attempts[] | select(.ok == false)] | length')
