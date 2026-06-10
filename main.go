@@ -41,8 +41,9 @@ var (
 		"qobuz":  {},
 		"amazon": {},
 		"deezer": {}, // served by the spotbye engine (upstream skips it)
+		"apple":  {}, // served by the spotbye engine (Apple Music ALAC pool)
 	}
-	defaultServices = []string{"tidal", "qobuz", "amazon", "deezer"}
+	defaultServices = []string{"tidal", "qobuz", "amazon", "deezer", "apple"}
 )
 
 const (

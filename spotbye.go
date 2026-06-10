@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -48,6 +49,8 @@ func spotbyePrefix(service string) string {
 		return "amz"
 	case "deezer":
 		return "dzr"
+	case "apple":
+		return "am" // single host (no a..e variant pool), uses mode= not quality=
 	default:
 		return ""
 	}
@@ -85,14 +88,14 @@ func (s *apiServer) resolveWithSpotbye(ctx context.Context, meta trackMetadata, 
 			continue
 		}
 
-		mediaURL, verr := s.spotbyePoolResolve(ctx, service, prefix, id)
+		resp, verr := s.spotbyePoolGet(ctx, service, prefix, id)
 		if verr != nil {
 			attempts = append(attempts, attempt{Service: service, Error: verr.Error()})
 			continue
 		}
 
 		outputPath := filepath.Join(outputDir, buildMonochromeFilename(meta))
-		if err := downloadMonochromeTrack(ctx, mediaURL, outputPath, meta); err != nil {
+		if err := s.spotbyeDownload(ctx, resp, outputPath, meta); err != nil {
 			attempts = append(attempts, attempt{Service: service, Error: "download failed: " + err.Error()})
 			continue
 		}
@@ -106,11 +109,10 @@ func (s *apiServer) resolveWithSpotbye(ctx context.Context, meta trackMetadata, 
 	return "", "", attempts, fmt.Errorf("spotbye failed in all services: %s", strings.Join(serviceOrder, " -> "))
 }
 
-// spotbyePoolResolve tries each "up" variant host's /api/dl until one returns an
-// ffmpeg-ingestible media URL (direct stream or a Tidal DASH manifest).
-func (s *apiServer) spotbyePoolResolve(ctx context.Context, service, prefix, id string) (string, error) {
-	variants := s.spotbyeVariants(ctx, service)
-	quality := spotbyeQuality(service)
+// spotbyePoolGet tries each live variant host's /api/dl until one returns a
+// usable response. Apple uses a single host (am.{domain}) and a "mode" param;
+// the others use {prefix}-{variant} hosts and a "quality" param.
+func (s *apiServer) spotbyePoolGet(ctx context.Context, service, prefix, id string) (*spotbyeDLResponse, error) {
 	// Base domain and /api/dl path are overridable via the config store so the
 	// pool can be repointed if SpotiFLAC-Next moves it, without a Go redeploy.
 	domain, dlPath := spotbyeBaseDomain, "/api/dl"
@@ -118,20 +120,38 @@ func (s *apiServer) spotbyePoolResolve(ctx context.Context, service, prefix, id 
 		domain = s.cfg.Setting("spotbye.base_domain", domain)
 		dlPath = s.cfg.Setting("spotbye.dl_path", dlPath)
 	}
+
+	// Build the request body (apple: mode=alac; others: quality=<q>).
+	var body []byte
+	if service == "apple" {
+		body, _ = json.Marshal(map[string]string{"id": id, "mode": "alac"})
+	} else {
+		body, _ = json.Marshal(map[string]string{"id": id, "quality": spotbyeQuality(service)})
+	}
+
+	// Apple has no a..e pool: a single host. Others rotate the live variants.
+	var hosts []string
+	if service == "apple" {
+		hosts = []string{fmt.Sprintf("https://%s.%s%s", prefix, domain, dlPath)}
+	} else {
+		for _, v := range s.spotbyeVariants(ctx, service) {
+			hosts = append(hosts, fmt.Sprintf("https://%s-%s.%s%s", prefix, v, domain, dlPath))
+		}
+	}
+
 	var lastErr error
-	for _, v := range variants {
-		host := fmt.Sprintf("https://%s-%s.%s%s", prefix, v, domain, dlPath)
-		media, err := s.spotbyeAPIDL(ctx, host, id, quality)
+	for _, host := range hosts {
+		resp, err := s.spotbyeAPIDL(ctx, host, body)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return media, nil
+		return resp, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no active variants")
 	}
-	return "", fmt.Errorf("spotbye %s: pool exhausted: %w", service, lastErr)
+	return nil, fmt.Errorf("spotbye %s: pool exhausted: %w", service, lastErr)
 }
 
 // spotbyeVariants returns the variant suffixes to try (status "up" ones first;
@@ -146,48 +166,90 @@ func (s *apiServer) spotbyeVariants(ctx context.Context, service string) []strin
 }
 
 type spotbyeDLResponse struct {
-	URL     string          `json:"url"`
-	Quality string          `json:"quality"`
-	Key     json.RawMessage `json:"key"`
-	Success *bool           `json:"success"`
-	Error   json.RawMessage `json:"error"`
+	URL     string `json:"url"`
+	Quality string `json:"quality"`
+	Mode    string `json:"mode"`
+	Key     string `json:"key"`
 }
 
-// spotbyeAPIDL POSTs to a pool host's /api/dl and returns an ffmpeg-ready URL.
-func (s *apiServer) spotbyeAPIDL(ctx context.Context, endpoint, id, quality string) (string, error) {
-	body, _ := json.Marshal(map[string]string{"id": id, "quality": quality})
+// spotbyeAPIDL POSTs a prepared body to a pool host's /api/dl and returns the
+// parsed response (must contain a url).
+func (s *apiServer) spotbyeAPIDL(ctx context.Context, endpoint string, body []byte) (*spotbyeDLResponse, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", defaultMonochromeUserAgent)
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request: %w", err)
+		return nil, fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	var data spotbyeDLResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data); err != nil {
-		return "", fmt.Errorf("decode: %w", err)
+		return nil, fmt.Errorf("decode: %w", err)
 	}
-	if data.URL == "" {
-		return "", fmt.Errorf("no url in response")
+	if !strings.HasPrefix(data.URL, "http") && !strings.HasPrefix(data.URL, "MANIFEST:") {
+		return nil, fmt.Errorf("no usable url in response")
 	}
-	if len(data.Key) > 0 && string(data.Key) != "null" {
-		// Amazon-style encrypted MP4 + key: needs mp4ff decryption, which the
-		// upstream backend handles — defer so the auto chain falls back to it.
-		return "", fmt.Errorf("encrypted stream (key present); deferring to upstream")
+	return &data, nil
+}
+
+// spotbyeDownload writes the track to outputPath from a pool response:
+//   - "MANIFEST:<b64>"  -> Tidal DASH, decoded + muxed by ffmpeg (inline-dash:)
+//   - url + key         -> Amazon CENC mp4: download, mp4ff-decrypt, transcode
+//   - plain url         -> direct stream, muxed by ffmpeg
+func (s *apiServer) spotbyeDownload(ctx context.Context, resp *spotbyeDLResponse, outputPath string, meta trackMetadata) error {
+	if strings.HasPrefix(resp.URL, "MANIFEST:") {
+		return downloadMonochromeTrack(ctx, "inline-dash:"+strings.TrimPrefix(resp.URL, "MANIFEST:"), outputPath, meta)
 	}
-	if strings.HasPrefix(data.URL, "MANIFEST:") {
-		// Tidal DASH manifest (base64). downloadMonochromeTrack understands the
-		// "inline-dash:" prefix and feeds the decoded .mpd to ffmpeg.
-		return "inline-dash:" + strings.TrimPrefix(data.URL, "MANIFEST:"), nil
+	if strings.TrimSpace(resp.Key) != "" {
+		return s.spotbyeDownloadEncrypted(ctx, resp.URL, resp.Key, outputPath, meta)
 	}
-	if !strings.HasPrefix(data.URL, "http") {
-		return "", fmt.Errorf("unexpected url form")
+	return downloadMonochromeTrack(ctx, resp.URL, outputPath, meta)
+}
+
+// spotbyeDownloadEncrypted downloads an Amazon-style CENC mp4, decrypts it with
+// the KID:KEY, then transcodes to FLAC (with metadata) via ffmpeg.
+func (s *apiServer) spotbyeDownloadEncrypted(ctx context.Context, mediaURL, keySpec, outputPath string, meta trackMetadata) error {
+	dir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
 	}
-	return data.URL, nil
+	encPath := filepath.Join(dir, "enc.mp4")
+	decPath := filepath.Join(dir, "dec.mp4")
+	defer func() { _ = os.Remove(encPath); _ = os.Remove(decPath) }()
+
+	if err := downloadFileTo(ctx, s.httpClient, mediaURL, encPath); err != nil {
+		return fmt.Errorf("fetch encrypted mp4: %w", err)
+	}
+	if err := decryptAmazonMP4(keySpec, encPath, decPath); err != nil {
+		return fmt.Errorf("decrypt: %w", err)
+	}
+	// Transcode the decrypted mp4 (ALAC/AAC) to FLAC, tagging with metadata.
+	return downloadMonochromeTrack(ctx, decPath, outputPath, meta)
+}
+
+// downloadFileTo streams a URL to a local file.
+func downloadFileTo(ctx context.Context, client *http.Client, rawURL, dest string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req.Header.Set("User-Agent", defaultMonochromeUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
 }
 
 // --- per-service track-id resolution ----------------------------------------
@@ -219,9 +281,92 @@ func (s *apiServer) spotbyeServiceID(ctx context.Context, service string, meta t
 			}
 		}
 		return "", fmt.Errorf("amazon: could not resolve id via odesli")
+	case "apple":
+		return s.resolveAppleID(ctx, meta)
 	default:
 		return "", fmt.Errorf("unsupported service: %s", service)
 	}
+}
+
+var appleSongIDRe = regexp.MustCompile(`[?&]i=(\d+)|/song/(?:[^/]+/)?(\d+)`)
+
+// resolveAppleID finds the Apple Music song id: first via odesli (the appleMusic
+// link's i=/song id), then via the public iTunes Search API matched on title.
+func (s *apiServer) resolveAppleID(ctx context.Context, meta trackMetadata) (string, error) {
+	// 1) odesli appleMusic link.
+	odesli := fmt.Sprintf("https://api.song.link/v1-alpha.1/links?url=https://open.spotify.com/track/%s&userCountry=US", url.QueryEscape(meta.SpotifyID))
+	var od struct {
+		LinksByPlatform map[string]struct {
+			URL string `json:"url"`
+		} `json:"linksByPlatform"`
+		Entities map[string]struct {
+			ID           string `json:"id"`
+			APIProvider  string `json:"apiProvider"`
+		} `json:"entitiesByUniqueId"`
+	}
+	if err := s.spotbyeGetJSON(ctx, odesli, &od); err == nil {
+		if l, ok := od.LinksByPlatform["appleMusic"]; ok && l.URL != "" {
+			if m := appleSongIDRe.FindStringSubmatch(l.URL); m != nil {
+				if m[1] != "" {
+					return m[1], nil
+				}
+				if m[2] != "" {
+					return m[2], nil
+				}
+			}
+		}
+		for _, e := range od.Entities {
+			if (e.APIProvider == "appleMusic" || e.APIProvider == "itunes") && e.ID != "" {
+				return e.ID, nil
+			}
+		}
+	}
+
+	// 2) iTunes Search fallback (match the title; no auth needed).
+	if id := s.resolveAppleViaITunes(ctx, meta); id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("apple: could not resolve song id (not on odesli/iTunes)")
+}
+
+func (s *apiServer) resolveAppleViaITunes(ctx context.Context, meta trackMetadata) string {
+	term := strings.TrimSpace(meta.Name + " " + firstArtist(meta.Artists))
+	u := fmt.Sprintf("https://itunes.apple.com/search?term=%s&entity=song&limit=10&country=US", url.QueryEscape(term))
+	var res struct {
+		Results []struct {
+			TrackID    int64  `json:"trackId"`
+			TrackName  string `json:"trackName"`
+			ArtistName string `json:"artistName"`
+		} `json:"results"`
+	}
+	if err := s.spotbyeGetJSON(ctx, u, &res); err != nil {
+		return ""
+	}
+	wantTitle := strings.ToLower(strings.TrimSpace(meta.Name))
+	for _, r := range res.Results {
+		if r.TrackID != 0 && strings.Contains(strings.ToLower(r.TrackName), wantTitle) {
+			return fmt.Sprintf("%d", r.TrackID)
+		}
+	}
+	if len(res.Results) > 0 && res.Results[0].TrackID != 0 {
+		return fmt.Sprintf("%d", res.Results[0].TrackID)
+	}
+	return ""
+}
+
+// spotbyeGetJSON does a GET and decodes JSON (shared by the id resolvers).
+func (s *apiServer) spotbyeGetJSON(ctx context.Context, endpoint string, out any) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req.Header.Set("User-Agent", defaultMonochromeUserAgent)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(out)
 }
 
 type qobuzTrack struct {

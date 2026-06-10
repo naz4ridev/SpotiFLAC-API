@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestSpotbyePrefixAndQuality(t *testing.T) {
-	cases := map[string]string{"tidal": "tdl", "qobuz": "qbz", "amazon": "amz", "deezer": "dzr", "apple": ""}
+	cases := map[string]string{"tidal": "tdl", "qobuz": "qbz", "amazon": "amz", "deezer": "dzr", "apple": "am", "bogus": ""}
 	for svc, want := range cases {
 		if got := spotbyePrefix(svc); got != want {
 			t.Errorf("spotbyePrefix(%q) = %q, want %q", svc, got, want)
