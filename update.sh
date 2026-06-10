@@ -411,29 +411,54 @@ if ! curl -fsSL -m 30 -X GET "${COOLIFY_REDEPLOY_URL}" >/dev/null 2>&1; then
   log_warn "Coolify webhook call returned non-200 or timed out. Checking deployment health anyway..."
 fi
 
-# 10. Poll /health to verify deployment
+# 10. Poll /health to verify deployment.
+#
+# Crucially, when the Go module changed we wait until /health reports the NEW
+# build (its spotiflac_version contains the expected commit SHA) — otherwise the
+# old container answers /health immediately and the smoke test would validate the
+# stale build, causing a misleading rollback. If the new build never appears
+# within the timeout, Coolify did not deploy it (e.g. the redeploy webhook
+# failed) and we say so explicitly.
 log_info "Waiting for service to become healthy (Timeout: ${COOLIFY_DEPLOY_TIMEOUT_SECONDS}s)..."
 BASE_URL="${BASE_URL%/}"
 HEALTH_URL="${BASE_URL}/health"
 SERVICE_UP=false
 START_TIME=$(date +%s)
 
+EXPECT_SHA=""
+[ "$GO_CHANGED" = "true" ] && EXPECT_SHA="$GO_REMOTE_SHORT_SHA"
+
 while true; do
-  CURRENT_TIME=$(date +%s)
-  ELAPSED=$((CURRENT_TIME - START_TIME))
-  
-  log_info "Polling health endpoint (${ELAPSED}s / ${COOLIFY_DEPLOY_TIMEOUT_SECONDS}s)..."
-  if curl -fsSL --connect-timeout 2 -m 4 "$HEALTH_URL" | jq -e '.ok == true' >/dev/null 2>&1; then
-    SERVICE_UP=true
-    log_info "Service is up and responding /health."
-    break
+  ELAPSED=$(( $(date +%s) - START_TIME ))
+  HEALTH_JSON=$(curl -fsSL --connect-timeout 2 -m 4 "$HEALTH_URL" 2>/dev/null || echo "")
+
+  if echo "$HEALTH_JSON" | jq -e '.ok == true' >/dev/null 2>&1; then
+    if [ -z "$EXPECT_SHA" ]; then
+      SERVICE_UP=true
+      log_info "Service is up and responding /health."
+      break
+    fi
+    DEPLOYED_VER=$(echo "$HEALTH_JSON" | jq -r '.spotiflac_version // ""')
+    if echo "$DEPLOYED_VER" | grep -q "$EXPECT_SHA"; then
+      SERVICE_UP=true
+      log_info "New build is live (spotiflac ${DEPLOYED_VER}) after ${ELAPSED}s."
+      break
+    fi
+    log_info "Service up but still the old build (${DEPLOYED_VER:-?}); waiting for ${EXPECT_SHA} (${ELAPSED}s / ${COOLIFY_DEPLOY_TIMEOUT_SECONDS}s)..."
+  else
+    log_info "Polling health endpoint (${ELAPSED}s / ${COOLIFY_DEPLOY_TIMEOUT_SECONDS}s)..."
   fi
-  
+
   if [ "$ELAPSED" -ge "$COOLIFY_DEPLOY_TIMEOUT_SECONDS" ]; then
     break
   fi
   sleep 4
 done
+
+if [ "$SERVICE_UP" != true ] && [ -n "$EXPECT_SHA" ]; then
+  log_error "The new build (spotiflac ${EXPECT_SHA}) never went live within ${COOLIFY_DEPLOY_TIMEOUT_SECONDS}s."
+  log_error "Coolify did not deploy the pushed commit — check COOLIFY_REDEPLOY_URL / Coolify auto-deploy."
+fi
 
 # 11. Run smoke test on deployed API
 SMOKE_PASSED=false

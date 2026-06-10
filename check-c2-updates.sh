@@ -107,13 +107,32 @@ if [[ -f "$MONO_FETCHER" ]]; then
   fi
 fi
 
-# Ensure gdown is available in a local venv.
-VENV="$STATE_DIR/venv"
-if [[ ! -x "$VENV/bin/python3" ]]; then
-  log "Creating venv for gdown at $VENV"
-  python3 -m venv "$VENV"
+# Monochrome is done; persist what we know so far so the consolidated
+# notification has the Monochrome counts even if the (heavier) SpotiFLAC-Next
+# step below can't run on this host.
+write_summary
+
+# Ensure gdown is available to download the SpotiFLAC-Next build. Prefer the
+# system python3 (no venv needed); fall back to a --user install, then a venv.
+# If none works (e.g. python3-venv/pip missing), skip the SpotiFLAC-Next step
+# WITHOUT failing — Monochrome was already refreshed.
+PYBIN="python3"
+if ! python3 -c 'import gdown' 2>/dev/null; then
+  log "gdown not found; attempting to install..."
+  if python3 -m pip install --user --quiet --upgrade gdown 2>/dev/null && python3 -c 'import gdown' 2>/dev/null; then
+    log "gdown installed via pip --user."
+  elif python3 -m venv "$STATE_DIR/venv" 2>/dev/null && "$STATE_DIR/venv/bin/pip" install --quiet --upgrade gdown 2>/dev/null; then
+    PYBIN="$STATE_DIR/venv/bin/python3"
+    log "gdown installed in venv."
+  else
+    log "WARNING: could not install gdown. Install on the host: sudo apt install python3-pip python3-venv"
+    log "Skipping SpotiFLAC-Next version check (Monochrome was refreshed)."
+    NEXT_VERSION="unknown (gdown unavailable)"
+    NEXT_CHANGED=false
+    write_summary
+    exit 0
+  fi
 fi
-"$VENV/bin/pip" install --quiet --upgrade gdown >/dev/null
 
 WORKDIR="$(mktemp -d -t spotiflac-next-check.XXXXXX)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -121,7 +140,13 @@ trap 'rm -rf "$WORKDIR"' EXIT
 log "Fetching latest SpotiFLAC-Next (gist $GIST_ID)..."
 FETCH_ARGS=(--gist-id "$GIST_ID" --workdir "$WORKDIR")
 [[ -n "$FORCE_VERSION" ]] && FETCH_ARGS+=(--version "$FORCE_VERSION")
-FETCH_JSON="$("$VENV/bin/python3" "$FETCHER" "${FETCH_ARGS[@]}")"
+if ! FETCH_JSON="$("$PYBIN" "$FETCHER" "${FETCH_ARGS[@]}")"; then
+  log "WARNING: failed to fetch the latest SpotiFLAC-Next build; skipping (Monochrome refreshed)."
+  NEXT_VERSION="unknown (fetch failed)"
+  NEXT_CHANGED=false
+  write_summary
+  exit 0
+fi
 
 VERSION="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
 BINARY="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["binary"])')"
