@@ -112,10 +112,32 @@ fi
 # step below can't run on this host.
 write_summary
 
-# Ensure gdown is available to download the SpotiFLAC-Next build. Prefer the
-# system python3 (no venv needed); fall back to a --user install, then a venv.
-# If none works (e.g. python3-venv/pip missing), skip the SpotiFLAC-Next step
-# WITHOUT failing — Monochrome was already refreshed.
+# 1) Detect the latest SpotiFLAC-Next version CHEAPLY — scrape the Drive folder
+#    (no gdown, no large download). This always works, so the notification gets
+#    the real version even on hosts where the heavy download can't run.
+if [[ -n "$FORCE_VERSION" ]]; then
+  NEXT_VERSION="$FORCE_VERSION"
+elif VCHECK_JSON="$(python3 "$FETCHER" --gist-id "$GIST_ID" --check-version 2>/dev/null)"; then
+  NEXT_VERSION="$(echo "$VCHECK_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || echo unknown)"
+else
+  NEXT_VERSION="unknown (version check failed)"
+fi
+log "Latest SpotiFLAC-Next version: ${NEXT_VERSION} (current: ${LAST_VERSION:-none})"
+
+if [[ "$NEXT_VERSION" == "$LAST_VERSION" || "$NEXT_VERSION" == unknown* ]]; then
+  NEXT_CHANGED=false
+  write_summary
+  [[ "$NEXT_VERSION" == "$LAST_VERSION" ]] && log "No new SpotiFLAC-Next version." || log "Version undetermined; skipping download."
+  exit 0
+fi
+NEXT_CHANGED=true
+write_summary   # record the new version now, in case the download below can't run
+log "New SpotiFLAC-Next version: ${LAST_VERSION:-none} -> ${NEXT_VERSION}. Downloading to extract C2..."
+
+# 2) A new version exists -> download the build (needs gdown) and extract its C2.
+#    Try system python3, then pip --user, then a venv. If none works, keep the
+#    detected version but leave endpoints unchanged (non-fatal; do NOT advance
+#    the last-seen version so it retries next run).
 PYBIN="python3"
 if ! python3 -c 'import gdown' 2>/dev/null; then
   log "gdown not found; attempting to install..."
@@ -125,42 +147,22 @@ if ! python3 -c 'import gdown' 2>/dev/null; then
     PYBIN="$STATE_DIR/venv/bin/python3"
     log "gdown installed in venv."
   else
-    log "WARNING: could not install gdown. Install on the host: sudo apt install python3-pip python3-venv"
-    log "Skipping SpotiFLAC-Next version check (Monochrome was refreshed)."
-    NEXT_VERSION="unknown (gdown unavailable)"
-    NEXT_CHANGED=false
-    write_summary
+    log "WARNING: gdown unavailable (install: sudo apt install python3-pip python3-venv)."
+    log "Detected ${NEXT_VERSION} but cannot download/extract C2; endpoints NOT updated."
     exit 0
   fi
 fi
 
 WORKDIR="$(mktemp -d -t spotiflac-next-check.XXXXXX)"
 trap 'rm -rf "$WORKDIR"' EXIT
-
-log "Fetching latest SpotiFLAC-Next (gist $GIST_ID)..."
-FETCH_ARGS=(--gist-id "$GIST_ID" --workdir "$WORKDIR")
-[[ -n "$FORCE_VERSION" ]] && FETCH_ARGS+=(--version "$FORCE_VERSION")
-if ! FETCH_JSON="$("$PYBIN" "$FETCHER" "${FETCH_ARGS[@]}")"; then
-  log "WARNING: failed to fetch the latest SpotiFLAC-Next build; skipping (Monochrome refreshed)."
-  NEXT_VERSION="unknown (fetch failed)"
-  NEXT_CHANGED=false
-  write_summary
+log "Downloading SpotiFLAC-Next ${NEXT_VERSION}..."
+if ! FETCH_JSON="$("$PYBIN" "$FETCHER" --gist-id "$GIST_ID" --version "$NEXT_VERSION" --workdir "$WORKDIR")"; then
+  log "WARNING: failed to download/extract the build; endpoints NOT updated (will retry next run)."
   exit 0
 fi
-
-VERSION="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
+VERSION="$NEXT_VERSION"
 BINARY="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["binary"])')"
-log "Latest version: $VERSION (binary: $BINARY)"
-NEXT_VERSION="$VERSION"
-
-if [[ "$VERSION" == "$LAST_VERSION" ]]; then
-  log "No new SpotiFLAC-Next version (current: $LAST_VERSION)."
-  NEXT_CHANGED=false
-  write_summary
-  exit 0
-fi
-log "New version detected: $LAST_VERSION -> $VERSION"
-NEXT_CHANGED=true
+log "Downloaded binary: $BINARY"
 
 NEW_MANIFEST="$WORKDIR/c2-manifest.json"
 python3 "$EXTRACTOR" "$BINARY" -o "$NEW_MANIFEST"

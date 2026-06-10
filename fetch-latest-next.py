@@ -144,13 +144,39 @@ def locate_binary(root: str) -> str:
     raise SystemExit(f"could not locate the app binary under {root}")
 
 
+def _semver_key(v: str):
+    m = VERSION_RE.search(v)
+    return tuple(int(x) for x in m.group().lstrip("v").split(".")) if m else (0, 0, 0)
+
+
+def latest_version_from_folder(folder_id: str) -> str:
+    """Return the highest version (folder name) in the public Drive folder by
+    scraping its page — no gdown and no large download needed. Used for cheap
+    version detection on every run."""
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        html = resp.read().decode("utf-8", "replace")
+    versions = set(VERSION_RE.findall(html))
+    if not versions:
+        raise SystemExit("could not find any version in the Drive folder page")
+    return max(versions, key=_semver_key)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gist-id", default=DEFAULT_GIST_ID)
     ap.add_argument("--version", help="specific version to fetch (e.g. v1.3.3); default: latest")
+    ap.add_argument("--check-version", action="store_true",
+                    help="only detect the latest version (scrape the Drive folder; no gdown/download)")
     ap.add_argument("--workdir", help="working directory (default: a temp dir)")
     ap.add_argument("--keep", action="store_true", help="keep the workdir on exit")
     args = ap.parse_args(argv)
+
+    if args.check_version:
+        folder_id = gist_drive_folder_id(args.gist_id)
+        print(json.dumps({"version": latest_version_from_folder(folder_id)}))
+        return 0
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="spotiflac-next-")
     os.makedirs(workdir, exist_ok=True)
