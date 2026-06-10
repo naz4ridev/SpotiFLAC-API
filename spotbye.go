@@ -111,9 +111,16 @@ func (s *apiServer) resolveWithSpotbye(ctx context.Context, meta trackMetadata, 
 func (s *apiServer) spotbyePoolResolve(ctx context.Context, service, prefix, id string) (string, error) {
 	variants := s.spotbyeVariants(ctx, service)
 	quality := spotbyeQuality(service)
+	// Base domain and /api/dl path are overridable via the config store so the
+	// pool can be repointed if SpotiFLAC-Next moves it, without a Go redeploy.
+	domain, dlPath := spotbyeBaseDomain, "/api/dl"
+	if s.cfg != nil {
+		domain = s.cfg.Setting("spotbye.base_domain", domain)
+		dlPath = s.cfg.Setting("spotbye.dl_path", dlPath)
+	}
 	var lastErr error
 	for _, v := range variants {
-		host := fmt.Sprintf("https://%s-%s.%s/api/dl", prefix, v, spotbyeBaseDomain)
+		host := fmt.Sprintf("https://%s-%s.%s%s", prefix, v, domain, dlPath)
 		media, err := s.spotbyeAPIDL(ctx, host, id, quality)
 		if err != nil {
 			lastErr = err
