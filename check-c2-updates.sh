@@ -9,7 +9,7 @@
 #   4. if changed and --apply: POST /admin/c2/import to the running API
 #
 # Intended to run on the host (e.g. from the same systemd timer as update.sh).
-# Requires: python3, gdown (auto-installed into a venv), and 7z or hdiutil.
+# Requires: python3, unzip, and 7z (Linux) or hdiutil (macOS). No gdown needed.
 #
 # Env / flags:
 #   API_BASE_URL          API base for /admin/c2/import (default http://127.0.0.1:8080)
@@ -134,30 +134,15 @@ NEXT_CHANGED=true
 write_summary   # record the new version now, in case the download below can't run
 log "New SpotiFLAC-Next version: ${LAST_VERSION:-none} -> ${NEXT_VERSION}. Downloading to extract C2..."
 
-# 2) A new version exists -> download the build (needs gdown) and extract its C2.
-#    Try system python3, then pip --user, then a venv. If none works, keep the
-#    detected version but leave endpoints unchanged (non-fatal; do NOT advance
-#    the last-seen version so it retries next run).
-PYBIN="python3"
-if ! python3 -c 'import gdown' 2>/dev/null; then
-  log "gdown not found; attempting to install..."
-  if python3 -m pip install --user --quiet --upgrade gdown 2>/dev/null && python3 -c 'import gdown' 2>/dev/null; then
-    log "gdown installed via pip --user."
-  elif python3 -m venv "$STATE_DIR/venv" 2>/dev/null && "$STATE_DIR/venv/bin/pip" install --quiet --upgrade gdown 2>/dev/null; then
-    PYBIN="$STATE_DIR/venv/bin/python3"
-    log "gdown installed in venv."
-  else
-    log "WARNING: gdown unavailable (install: sudo apt install python3-pip python3-venv)."
-    log "Detected ${NEXT_VERSION} but cannot download/extract C2; endpoints NOT updated."
-    exit 0
-  fi
-fi
-
+# 2) A new version exists -> download ONLY its macOS zip (~18 MB, direct from
+#    Drive; no gdown) and extract its C2. Needs `unzip` + (`7z` on Linux /
+#    `hdiutil` on macOS). Non-fatal: on failure keep the detected version but
+#    leave endpoints unchanged and do NOT advance last-seen (retry next run).
 WORKDIR="$(mktemp -d -t spotiflac-next-check.XXXXXX)"
 trap 'rm -rf "$WORKDIR"' EXIT
-log "Downloading SpotiFLAC-Next ${NEXT_VERSION}..."
-if ! FETCH_JSON="$("$PYBIN" "$FETCHER" --gist-id "$GIST_ID" --version "$NEXT_VERSION" --workdir "$WORKDIR")"; then
-  log "WARNING: failed to download/extract the build; endpoints NOT updated (will retry next run)."
+log "Downloading SpotiFLAC-Next ${NEXT_VERSION} (macOS build)..."
+if ! FETCH_JSON="$(python3 "$FETCHER" --gist-id "$GIST_ID" --version "$NEXT_VERSION" --workdir "$WORKDIR")"; then
+  log "WARNING: failed to download/extract the build (need unzip + 7z/hdiutil); endpoints NOT updated (will retry next run)."
   exit 0
 fi
 VERSION="$NEXT_VERSION"
