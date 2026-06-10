@@ -42,13 +42,12 @@ else
   notify_telegram() { :; }
 fi
 
-# refresh_endpoints brings the running API's C2 config up to date BEFORE the
-# strict smoke test: it refreshes the Monochrome instance list (INSTANCES.md)
-# and detects/imports any new SpotiFLAC-Next version's endpoints. This is what
-# makes the app resilient to endpoint changes between releases — the updater
-# updates them dynamically instead of relying on hard-coded values. The
-# SpotiFLAC (Go upstream) endpoints are refreshed by deploying the new module
-# (it resolves them dynamically at runtime).
+# refresh_endpoints keeps the running API's dynamic config current BEFORE the
+# strict smoke test: it refreshes the Monochrome instance list (INSTANCES.md) and
+# detects the latest SpotiFLAC-Next version (for the notification). It does NOT
+# import download C2 — those are the live per-variant pool the API resolves at
+# runtime from the status payload + spotbye.base_domain. The SpotiFLAC (Go
+# upstream) endpoints are refreshed by deploying the new module.
 # Detected versions, populated by refresh_endpoints (for notifications).
 NEXT_VERSION="unknown"; NEXT_CHANGED="false"; MONO_API_COUNT="?"; MONO_CHANGED="false"
 refresh_endpoints() {

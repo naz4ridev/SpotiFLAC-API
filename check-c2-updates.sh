@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 #
-# Detect a new SpotiFLAC-Next release and refresh the API's C2 endpoints.
+# Keep the API's dynamic config current and detect new SpotiFLAC-Next releases.
 #
-# Pipeline:
-#   1. fetch-latest-next.py : gist -> Google Drive -> macOS .dmg -> .app binary
-#   2. extract-spotiflac-next.py : binary -> c2-manifest.json
-#   3. diff against the committed reference manifest
-#   4. if changed and --apply: POST /admin/c2/import to the running API
+# What it does (lightweight; no binary download):
+#   1. Refresh the Monochrome instance list from the canonical INSTANCES.md
+#      (--apply pushes it to the running API: monochrome.* settings).
+#   2. Detect the latest SpotiFLAC-Next version (scrape the Drive folder; no gdown,
+#      no download) and notify on change.
 #
-# Intended to run on the host (e.g. from the same systemd timer as update.sh).
-# Requires: python3, unzip, and 7z (Linux) or hdiutil (macOS). No gdown needed.
+# It no longer imports the binary's C2: download endpoints are the live per-variant
+# pool ({prefix}-{variant}.spotbye.qzz.io/api/dl) that the API resolves AT RUNTIME
+# from the status payload + the spotbye.base_domain setting. (For manual inspection
+# use update-c2-from-binary.sh; pool base domain/path are editable at /admin.)
+#
+# Intended to run on the host (same systemd timer as update.sh). Requires: python3.
 #
 # Env / flags:
-#   API_BASE_URL          API base for /admin/c2/import (default http://127.0.0.1:8080)
+#   API_BASE_URL          API base for monochrome settings (default http://127.0.0.1:8080)
 #   STATE_DIR             where the last seen version is recorded (default ./state)
 #   SPOTIFLAC_NEXT_GIST   gist id (default b2f7b815b1560d7a58d7dd847f073f00)
-#   --apply               push the new manifest to the API
+#   --apply               push refreshed Monochrome instances to the API
 #   --version vX.Y.Z      force a specific version instead of latest
 set -euo pipefail
 
@@ -131,61 +135,21 @@ if [[ "$NEXT_VERSION" == "$LAST_VERSION" || "$NEXT_VERSION" == unknown* ]]; then
   exit 0
 fi
 NEXT_CHANGED=true
-write_summary   # record the new version now, in case the download below can't run
-log "New SpotiFLAC-Next version: ${LAST_VERSION:-none} -> ${NEXT_VERSION}. Downloading to extract C2..."
-
-# 2) A new version exists -> download ONLY its macOS zip (~18 MB, direct from
-#    Drive; no gdown) and extract its C2. Needs `unzip` + (`7z` on Linux /
-#    `hdiutil` on macOS). Non-fatal: on failure keep the detected version but
-#    leave endpoints unchanged and do NOT advance last-seen (retry next run).
-WORKDIR="$(mktemp -d -t spotiflac-next-check.XXXXXX)"
-trap 'rm -rf "$WORKDIR"' EXIT
-log "Downloading SpotiFLAC-Next ${NEXT_VERSION} (macOS build)..."
-if ! FETCH_JSON="$(python3 "$FETCHER" --gist-id "$GIST_ID" --version "$NEXT_VERSION" --workdir "$WORKDIR")"; then
-  log "WARNING: failed to download/extract the build (need unzip + 7z/hdiutil); endpoints NOT updated (will retry next run)."
-  exit 0
-fi
-VERSION="$NEXT_VERSION"
-BINARY="$(echo "$FETCH_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["binary"])')"
-log "Downloaded binary: $BINARY"
-
-NEW_MANIFEST="$WORKDIR/c2-manifest.json"
-python3 "$EXTRACTOR" "$BINARY" -o "$NEW_MANIFEST"
-
-C2_DIFF="(no reference manifest to diff against)"
-if [[ -f "$REF_MANIFEST" ]]; then
-  log "C2 changes vs reference:"
-  C2_DIFF="$(python3 "$EXTRACTOR" "$BINARY" --diff "$REF_MANIFEST" 2>/dev/null || true)"
-  echo "$C2_DIFF"
-fi
-
-APPLIED_NOTE="(dry-run; not applied)"
-if [[ "$APPLY" == "1" ]]; then
-  log "Importing new C2 into API at $API_BASE_URL"
-  if curl -fsS -X POST "$API_BASE_URL/admin/c2/import" \
-      -H 'Content-Type: application/json' --data-binary "@$NEW_MANIFEST"; then
-    echo
-    APPLIED_NOTE="Imported into the running API."
-  else
-    APPLIED_NOTE="Import to API FAILED."
-  fi
-fi
-
 write_summary
+log "New SpotiFLAC-Next version detected: ${LAST_VERSION:-none} -> ${NEXT_VERSION}"
 
-# Notify about the new SpotiFLAC-Next version and its C2 changes — unless the
-# caller (update.sh) will send a single consolidated notification.
+# NOTE: the API no longer needs the binary's C2 imported. The download endpoints
+# are the live per-variant pool ({prefix}-{variant}.${SPOTBYE_BASE:-spotbye.qzz.io}
+# /api/dl) which the app resolves AT RUNTIME from the status payload + the
+# spotbye.base_domain setting. So a new version normally needs nothing imported.
+# (For deep inspection you can still diff a build manually with
+#  update-c2-from-binary.sh; the pool base domain/path are editable at /admin.)
 if [[ "$NO_NOTIFY" != "1" ]]; then
-  notify_telegram "🆕 SpotiFLAC-Next ${VERSION} detectado" "Versión anterior: ${LAST_VERSION:-ninguna}
-${APPLIED_NOTE}
+  notify_telegram "🆕 SpotiFLAC-Next ${NEXT_VERSION} detectado" "Versión anterior: ${LAST_VERSION:-ninguna}
 Monochrome: ${MONO_API_COUNT} API instances$([ "$MONO_CHANGED" = true ] && echo ' (cambió)')
-
-Cambios de C2/endpoints:
-${C2_DIFF}"
+Endpoints de descarga: pool dinámico (status + spotbye.base_domain), no requiere import.
+Si las descargas fallan tras esta versión, revisa el esquema del pool en /admin."
 fi
 
-# Persist the reference manifest and the seen version.
-cp "$NEW_MANIFEST" "$REF_MANIFEST"
-echo "$VERSION" > "$LAST_VERSION_FILE"
-log "Updated reference manifest and recorded version $VERSION."
-log "Review/commit $REF_MANIFEST if running from a git checkout."
+echo "$NEXT_VERSION" > "$LAST_VERSION_FILE"
+log "Recorded SpotiFLAC-Next version ${NEXT_VERSION}."

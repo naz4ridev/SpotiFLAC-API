@@ -14,11 +14,13 @@ To keep the production environment clean, the updater lives in a dedicated branc
    - `go test ./...` (unit tests validation)
    - `docker compose build` (verifies Docker image compiles successfully)
 4. **Zero-Staging Deployment**: If checks pass, it pushes the updated `go.mod`/`go.sum` back to the remote `main` branch and triggers a Coolify redeploy webhook.
-5. **Dynamic endpoint refresh**: Before validating, the updater refreshes the C2
-   endpoints so the app follows provider changes between releases — Monochrome
-   instances (from INSTANCES.md) and SpotiFLAC-Next endpoints (extracted from the
-   latest build) are imported into the running API via `check-c2-updates.sh`. The
-   SpotiFLAC Go upstream resolves its own endpoints dynamically once deployed.
+5. **Dynamic config refresh**: Before validating, the updater refreshes the
+   Monochrome instance list (INSTANCES.md → API settings) and detects the latest
+   SpotiFLAC-Next version, via `check-c2-updates.sh`. Download endpoints are NOT
+   imported: they are the live per-variant pool
+   (`{prefix}-{variant}.spotbye.qzz.io/api/dl`) the API resolves at runtime from
+   the status payload + `spotbye.base_domain`. The SpotiFLAC Go upstream resolves
+   its own community endpoints once deployed.
 6. **Post-Deploy Smoke Test**: Polls `/health`, checks `/v1/status` +
    `/diagnostics/providers`, and runs `smoke-test.sh`, which performs a **real,
    required end-to-end download** (validated with `ffprobe`) against the
@@ -29,35 +31,36 @@ To keep the production environment clean, the updater lives in a dedicated branc
 
 ---
 
-## C2 endpoint maintenance (SpotiFLAC-Next + Monochrome)
+## C2 / endpoint maintenance (SpotiFLAC-Next + Monochrome)
 
-The API keeps its C2 endpoints and settings in a SQLite store (`C2_DB_PATH`,
-default `/app/data/c2.db`, persisted on the `c2-data` Docker volume). The
-branch-based updater only bumps `go.mod`/`go.sum` and redeploys, so the volume —
-and all operator C2 edits — persists across updates automatically. View/edit at
-`/admin/` (web) or via the `/admin/c2` API.
+Download endpoints are NOT stored or imported: SpotiFLAC-Next uses a live
+per-variant pool — `POST {prefix}-{variant}.spotbye.qzz.io/api/dl {id,quality}`
+(prefix tidal=tdl, qobuz=qbz, amazon=amz, deezer=dzr; variants a..e Shared + x
+Community) — which the API resolves **at runtime** from the downloader-status
+payload and the editable `spotbye.base_domain` / `spotbye.dl_path` settings. So a
+new SpotiFLAC-Next release normally needs nothing imported.
 
-This branch also carries the C2 maintenance tooling (kept at the branch root so
-it is self-contained on the host):
+The API keeps editable settings (Monochrome lists, lyrics sp_dc, spotbye.*,
+status source) in a SQLite store (`C2_DB_PATH`, default `/app/data/c2.db`,
+persisted on the `c2-data` Docker volume) — view/edit at `/admin/`.
 
-- **`check-c2-updates.sh`** — the orchestrator. On each run it refreshes the
-  Monochrome instance list from the canonical
-  [INSTANCES.md](https://github.com/monochrome-music/monochrome/blob/main/INSTANCES.md),
-  detects a new SpotiFLAC-Next release (gist → Google Drive → macOS `.dmg` →
-  `.app`), extracts its C2 (`extract-spotiflac-next.py`), diffs against the
-  committed `c2-manifest.json`, and with `--apply` imports the changes into the
-  running API (`POST /admin/c2/import`). It records the last seen version in
-  `STATE_DIR`. Requires `python3` + `7z`/`hdiutil`; `gdown` is auto-installed in
-  a venv.
+Tooling on this branch:
+
+- **`check-c2-updates.sh`** — orchestrator (run from the timer): refreshes the
+  Monochrome instances from the canonical
+  [INSTANCES.md](https://github.com/monochrome-music/monochrome/blob/main/INSTANCES.md)
+  (`--apply` → `monochrome.*` settings) and detects the latest SpotiFLAC-Next
+  version (scrape only; no download). Records the last seen version in
+  `STATE_DIR`. Requires only `python3`.
 
   ```bash
   API_BASE_URL="$BASE_URL" ./check-c2-updates.sh --apply
   ```
 
-- **`fetch-latest-next.py`** — gist → Drive → dmg → `.app` binary resolver.
 - **`fetch-monochrome-instances.py`** — parse INSTANCES.md → `monochrome.*` settings.
-- **`extract-spotiflac-next.py`** / **`update-c2-from-binary.sh`** — static C2
-  extraction + diff/import from a binary you already have.
+- **`fetch-latest-next.py --check-version`** — latest SpotiFLAC-Next version (scrape).
+- **`extract-spotiflac-next.py`** / **`update-c2-from-binary.sh`** — optional,
+  manual static inspection of a build's strings (not part of the auto flow).
 
 Run `check-c2-updates.sh` from the same systemd timer as `update.sh` (see below).
 
