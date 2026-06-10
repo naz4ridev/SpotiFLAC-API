@@ -950,32 +950,23 @@ func (p *GoProvider) Download(ctx context.Context, req downloadRequest) download
 		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotbye(ctx, req.Metadata, req.ServiceOrder, req.OutputDir)
 		res.MethodUsed = downloadEngineSpotbye
 	default:
-		// auto: spotbye (Next C2) takes priority whenever its services are live
-		// per the status gating; then spotiflac (upstream), then monochrome. The
-		// result is the union of all three backends with spotbye preferred.
-		spotbyePath, spotbyeService, spotbyeAttempts, spotbyeErr := p.server.resolveWithSpotbye(ctx, req.Metadata, req.ServiceOrder, req.OutputDir)
-		attempts = append(attempts, spotbyeAttempts...)
-		if spotbyeErr == nil {
-			downloadPath = spotbyePath
-			serviceUsed = spotbyeService
-			res.MethodUsed = downloadEngineSpotbye
-		} else {
-			var spotiflacAttempts []attempt
-			downloadPath, serviceUsed, spotiflacAttempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
-			attempts = append(attempts, spotiflacAttempts...)
-			res.MethodUsed = downloadEngineSpotiFLAC
-
-			if err != nil {
-				monochromePath, monochromeAttempts, monochromeErr := p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
-				attempts = append(attempts, monochromeAttempts...)
-				if monochromeErr == nil {
-					downloadPath = monochromePath
-					serviceUsed = downloadEngineMonochrome
-					res.MethodUsed = downloadEngineMonochrome
-					err = nil
-				} else {
-					err = fmt.Errorf("spotbye failed: %v; spotiflac failed: %v; monochrome failed: %w", spotbyeErr, err, monochromeErr)
-				}
+		// auto: spotiflac is the REAL workflow — the upstream SpotiFLAC backend
+		// resolves ISRC/ASIN/trackID and downloads via its providers and the
+		// AES-GCM-decrypted "community" C2 endpoints baked into the module
+		// (exactly like SpotiFLAC/SpotiFLAC-Next; no hard-coded hosts). Then
+		// monochrome as a fallback.
+		downloadPath, serviceUsed, attempts, err = p.server.resolveWithSpotiFLAC(req.SpotifyID, req.SpotifyURL, req.Metadata, req.ServiceOrder, req.OutputDir)
+		res.MethodUsed = downloadEngineSpotiFLAC
+		if err != nil {
+			monochromePath, monochromeAttempts, monochromeErr := p.server.resolveWithMonochrome(ctx, req.Metadata, req.OutputDir)
+			attempts = append(attempts, monochromeAttempts...)
+			if monochromeErr == nil {
+				downloadPath = monochromePath
+				serviceUsed = downloadEngineMonochrome
+				res.MethodUsed = downloadEngineMonochrome
+				err = nil
+			} else {
+				err = fmt.Errorf("spotiflac failed: %v; monochrome failed: %w", err, monochromeErr)
 			}
 		}
 	}
